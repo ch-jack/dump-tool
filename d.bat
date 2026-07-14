@@ -1,14 +1,14 @@
 @echo off
-title DmZ / DmZ FXAP
+title DmZ Corp / DmZ Corp FXAP
 color 0A
 
 echo.
 echo ========================================
-echo      DmZ FXAP   /   DmZ FXAP
+echo      DmZ Corp FXAP   /   DmZ Corp FXAP
 echo ========================================
 echo.
 
-REM Prompt for link
+REM
 set /p LINK=Enter cfx.re link : 
 
 echo.
@@ -19,7 +19,7 @@ python auto.py %LINK%
 
 echo.
 echo ========================================
-echo      DmZ FXAP / Dump Finished!
+echo      DmZ Corp FXAP / Dump Finished!
 echo   Decrypted resources are in Output
 echo ========================================
 echo.

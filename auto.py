@@ -15,7 +15,6 @@ from Crypto.Util.Padding import unpad
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
-
 import warnings
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -546,7 +545,6 @@ if __name__=="__main__":
     print("=== FiveM Resource Dumper & Decryptor ===")
     print()
     
-    # Step 0: Token selection
     print("Sélectionnez votre méthode de token : ")
     print("1. Scanner automatiquement depuis FiveM ")
     print("2. Entrer un token personnalisé ")

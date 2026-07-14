@@ -1,4 +1,4 @@
-# DMZ FiveM Dump Tool
+# DMZ CORP FiveM Dump Tool
 
 A simple tool to dump FiveM resources.
 
@@ -20,6 +20,7 @@ A simple tool to dump FiveM resources.
 1. Make sure FiveM is closed.
 2. Run **`d.bat`**.
 3. Launch FiveM.
+4. Enter CFX IP
 4. Wait for the dump process to finish.
 5. The dumped files will be saved automatically.
 
