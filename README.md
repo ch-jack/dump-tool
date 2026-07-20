@@ -1,35 +1,75 @@
-# DMZ CORP FiveM Dump Tool
+# FiveM 服务器 Dump 工具
 
-A simple tool to dump FiveM resources.
+用于对 FiveM 服务器资源执行 Dump，并对已 Dump 的 FXAP 资源进行解密。
 
-## Requirements
+## 功能范围
 
-* Windows 10 / Windows 11
-* FiveM installed
-* Administrator privileges (recommended)
+- 包含：服务器 Dump
+- 包含：FXAP 解密
+- 不包含：模型修复
 
-## Installation
+说明：仓库内仍保留原工具自带的模型修复相关文件，但该功能存在已知问题，本工具箱接入不会调用模型修复。
 
-1. Download or clone this repository.
-2. Open the project folder.
-3. Run **`install.bat`**.
-4. Wait until the installation is complete.
+## 环境要求
 
-## Usage
+- Windows 10 / Windows 11
+- Python 3.7 或更高版本
+- FiveM 已安装并已进入目标服务器
+- 需要读取 FiveM 进程 token 时，建议以管理员身份运行
 
-1. Make sure FiveM is closed.
-2. Run **`d.bat`**.
-3. Launch FiveM.
-4. Enter CFX IP
-4. Wait for the dump process to finish.
-5. The dumped files will be saved automatically.
+## 安装
 
-## Notes
+1. 下载或克隆本仓库。
+2. 进入项目目录。
+3. 运行 `install.bat` 安装依赖。
 
-* Run the batch files as **Administrator** if you encounter permission issues.
-* Do not close the tool while the dumping process is running.
-* Your antivirus may display warnings depending on your system configuration.
+也可以手动安装依赖：
 
-## Disclaimer
+```bat
+pip install -r requirements.txt
+```
 
-This project is provided for educational and research purposes only. The author is not responsible for any misuse or damage resulting from the use of this software.
+## 使用
+
+交互模式：
+
+```bat
+python auto.py
+```
+
+直接传入目标地址：
+
+```bat
+python auto.py https://cfx.re/join/xxxx --token-choice 1
+python auto.py 1.2.3.4:30120 --token-choice 1
+```
+
+非交互模式，供 CK 工具箱调用：
+
+```bat
+python auto.py 1.2.3.4:30120 --token-choice 1 --resources all --output Output --report Output\_server_dump_report.json --non-interactive
+```
+
+`token_choice` 默认值为 `1`，表示自动扫描 FiveM 进程中的 token。需要手动 token 时可使用：
+
+```bat
+python auto.py 1.2.3.4:30120 --token-choice 2 --token YOUR_TOKEN
+```
+
+## 输出
+
+- 解密后的文件默认写入 `Output`
+- JSON 报告默认写入 `Output\_server_dump_report.json`
+- Markdown 报告默认写入 `Output\_server_dump_report.md`
+- 执行过程中会输出 `CK_PROGRESS` 进度事件，供 CK 工具箱实时显示
+
+## 注意事项
+
+- 请只在你有权限分析的服务器或资源上使用。
+- Dump 过程中不要关闭 FiveM 或本工具。
+- 如果自动扫描 token 失败，请确认 FiveM 已进入服务器，或以管理员身份运行。
+- 杀毒软件可能会根据本机策略对进程读取或打包工具提示风险。
+
+## 免责声明
+
+本项目仅用于学习、研究和授权场景。因误用造成的后果由使用者自行承担。

@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'manual' }
+          $version = $tag.TrimStart('v')
+          if (-not $version) { $version = 'manual' }
+          $assetName = "dump-tool-$version-windows.zip"
+          $rootName = "dump-tool-$version"
+          $stageRoot = Join-Path $env:RUNNER_TEMP $rootName
+          New-Item -ItemType Directory -Force -Path $stageRoot | Out-Null
+
+          $items = @(
+            'auto.py',
+            'requirements.txt',
+            'README.md',
+            'd.bat',
+            'install.bat',
+            'Bin',
+            'Tools',
+            'Fix',
+            'FIXER'
+          )
+          foreach ($item in $items) {
+            if (Test-Path -LiteralPath $item) {
+              Copy-Item -LiteralPath $item -Destination $stageRoot -Recurse -Force
+            }
+          }
+
+          $assetPath = Join-Path $PWD $assetName
+          if (Test-Path -LiteralPath $assetPath) { Remove-Item -LiteralPath $assetPath -Force }
+          Compress-Archive -Path $stageRoot -DestinationPath $assetPath -CompressionLevel Optimal
+
+          $hash = Get-FileHash -LiteralPath $assetPath -Algorithm SHA256
+          "$($hash.Hash.ToLowerInvariant())  $assetName" | Set-Content -LiteralPath "$assetPath.sha256" -Encoding ascii
+          "ASSET=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CHECKSUM=$assetPath.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
