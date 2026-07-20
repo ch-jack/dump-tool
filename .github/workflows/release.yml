@@ -2,12 +2,18 @@ name: release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: dump-tool-release
+  cancel-in-progress: false
 
 jobs:
   package:
@@ -17,17 +23,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare release metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseTag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "v1.0.$env:GITHUB_RUN_NUMBER" }
+          $releaseVersion = $releaseTag.TrimStart('v')
+          if ($releaseVersion -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid release version: $releaseVersion" }
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_VERSION=$releaseVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'manual' }
-          $version = $tag.TrimStart('v')
-          if (-not $version) { $version = 'manual' }
+          $version = $env:RELEASE_VERSION
           $assetName = "dump-tool-$version-windows.zip"
           $rootName = "dump-tool-$version"
           $stageRoot = Join-Path $env:RUNNER_TEMP $rootName
           New-Item -ItemType Directory -Force -Path $stageRoot | Out-Null
+
+          $required = @(
+            'auto.py',
+            'requirements.txt',
+            'Bin\Unpacker.exe',
+            'Tools\Decompile\unluac54.jar',
+            'FIXER\FivemDecryptFixer.exe'
+          )
+          foreach ($item in $required) {
+            if (-not (Test-Path -LiteralPath $item -PathType Leaf)) {
+              throw "Missing release file: $item"
+            }
+          }
 
           $items = @(
             'auto.py',
@@ -56,9 +83,14 @@ jobs:
           "CHECKSUM=$assetPath.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Publish release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
           files: |
             ${{ env.ASSET }}
             ${{ env.CHECKSUM }}
