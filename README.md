@@ -14,6 +14,7 @@
 
 - Windows 10 / Windows 11
 - Python 3.7 或更高版本
+- Java 8 或更高版本（推荐 Java 17，用于运行 `unluac54.jar`）
 - FiveM 已安装并已进入目标服务器
 - 需要读取 FiveM 进程 token 时，建议以管理员身份运行
 
@@ -29,6 +30,12 @@
 pip install -r requirements.txt
 ```
 
+Lua 5.4 反编译依赖 Java。程序会依次检测 `--java` 指定位置、`JAVA_HOME` 和系统 `PATH`；没有可用 Java 时会在 Dump 前直接停止，不会再把未反编译的字节码误写成 `.lua`。
+
+推荐安装 Eclipse Temurin Java 17 JRE：
+
+https://adoptium.net/temurin/releases/?version=17&os=windows&arch=x64&package=jre
+
 ## 使用
 
 交互模式：
@@ -42,6 +49,7 @@ python auto.py
 ```bat
 python auto.py https://cfx.re/join/xxxx --token-choice 1
 python auto.py 1.2.3.4:30120 --token-choice 1
+python auto.py 1.2.3.4:30120 --token-choice 1 --java "C:\Program Files\Eclipse Adoptium\jre-17"
 ```
 
 非交互模式，供 CK 工具箱调用：
@@ -61,6 +69,8 @@ python auto.py 1.2.3.4:30120 --token-choice 2 --token YOUR_TOKEN
 - 解密后的文件默认写入 `Output`
 - JSON 报告默认写入 `Output\_server_dump_report.json`
 - Markdown 报告默认写入 `Output\_server_dump_report.md`
+- 报告会记录实际 Java 路径、版本以及 Lua 反编译失败明细
+- `unluac54.jar` 失败时保留 `.luac` 字节码和错误文件，不再伪装成解密成功的 `.lua`
 - 执行过程中会输出 `CK_PROGRESS` 进度事件，供 CK 工具箱实时显示
 
 ## 注意事项

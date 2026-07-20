@@ -25,9 +25,11 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.1.1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMP_FOLDERS = ["Temp", "Unpacked", "TempCompiled", "Resources"]
+JAVA_MINIMUM_MAJOR = 8
+JAVA_RECOMMENDED_MAJOR = 17
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
@@ -113,6 +115,118 @@ def print_warning(message):
 
 def print_error(message):
     print(f"[错误] {message}", flush=True)
+
+
+def parse_java_major(version_text):
+    text = (version_text or "").strip()
+    match = re.search(r'(?i)\bversion\s+["\']?(\d+)(?:\.(\d+))?', text)
+    if not match:
+        match = re.search(r'(?i)\b(?:openjdk|java)\s+["\']?(\d+)(?:\.(\d+))?', text)
+    if not match:
+        return None
+    first = int(match.group(1))
+    second = int(match.group(2) or 0)
+    return second if first == 1 else first
+
+
+def java_candidates(configured_path=""):
+    def expand_candidate(value):
+        value = os.path.expandvars(os.path.expanduser((value or "").strip().strip('"')))
+        if not value:
+            return []
+        path = Path(value)
+        if path.is_file() or path.name.lower() in ("java.exe", "java"):
+            return [str(path.resolve())]
+        names = ["java.exe", "java"]
+        results = []
+        for name in names:
+            results.append(str(path / "bin" / name))
+            results.append(str(path / name))
+        return results
+
+    if configured_path:
+        return expand_candidate(configured_path)
+
+    candidates = []
+    java_home = os.environ.get("JAVA_HOME", "")
+    if java_home:
+        candidates.extend(expand_candidate(java_home))
+    path_java = shutil.which("java")
+    if path_java:
+        candidates.append(path_java)
+    return candidates
+
+
+def probe_java_executable(java_path):
+    candidate = os.path.abspath(java_path)
+    if not os.path.isfile(candidate):
+        return {"ok": False, "path": candidate, "reason": "java 可执行文件不存在。"}
+
+    try:
+        proc = subprocess.run(
+            [candidate, "-version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=10,
+        )
+    except Exception as exc:
+        return {"ok": False, "path": candidate, "reason": f"无法启动 java -version: {exc}"}
+
+    version_text = "\n".join(part for part in [proc.stderr, proc.stdout] if part).strip()
+    version_line = next((line.strip() for line in version_text.splitlines() if line.strip()), "")
+    if proc.returncode != 0:
+        detail = version_line or f"退出码 {proc.returncode}"
+        return {"ok": False, "path": candidate, "reason": f"java -version 执行失败: {detail}"}
+
+    major = parse_java_major(version_text)
+    if major is None:
+        return {"ok": False, "path": candidate, "reason": f"无法识别 Java 版本: {version_line or '无版本输出'}"}
+    if major < JAVA_MINIMUM_MAJOR:
+        return {
+            "ok": False,
+            "path": candidate,
+            "version": version_line,
+            "major": major,
+            "reason": f"Java {major} 版本过低，需要 Java {JAVA_MINIMUM_MAJOR} 或更高版本，推荐 Java {JAVA_RECOMMENDED_MAJOR}。",
+        }
+    return {
+        "ok": True,
+        "path": candidate,
+        "version": version_line,
+        "major": major,
+        "minimum_major": JAVA_MINIMUM_MAJOR,
+        "recommended_major": JAVA_RECOMMENDED_MAJOR,
+    }
+
+
+def resolve_java_executable(configured_path=""):
+    candidates = java_candidates(configured_path)
+    failures = []
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        info = probe_java_executable(candidate)
+        if info.get("ok"):
+            return info
+        if os.path.exists(candidate) or configured_path:
+            failures.append(info.get("reason") or f"Java 不可用: {candidate}")
+
+    if configured_path:
+        detail = failures[0] if failures else "选择的位置中没有找到 java.exe。"
+        raise RuntimeError(
+            f"所选 Java 环境不可用: {configured_path}。{detail} "
+            f"请安装 Java {JAVA_MINIMUM_MAJOR} 或更高版本（推荐 Java {JAVA_RECOMMENDED_MAJOR}），或重新选择 Java 目录。"
+        )
+    detail = f" 检测详情: {failures[0]}" if failures else ""
+    raise RuntimeError(
+        f"未检测到可用 Java，unluac54.jar 无法运行。请安装 Java {JAVA_MINIMUM_MAJOR} 或更高版本"
+        f"（推荐 Java {JAVA_RECOMMENDED_MAJOR}），或使用 --java 指定 Java 目录/java.exe。{detail}"
+    )
 
 
 def direct_server_address(value):
@@ -516,7 +630,7 @@ class FiveMDumper:
 
 
 class FiveMDecryptor:
-    def __init__(self, output_dir="Output"):
+    def __init__(self, output_dir="Output", java_executable=""):
         self.DefaultKey = bytes([
             0xB3, 0xCB, 0x2E, 0x04, 0x87, 0x94, 0xD6, 0x73,
             0x08, 0x23, 0xC4, 0x93, 0x7A, 0xBD, 0x18, 0xAD,
@@ -530,8 +644,14 @@ class FiveMDecryptor:
             0x61, 0x83, 0x2E, 0xEC, 0xA2, 0x4B, 0xFD, 0x56,
             0x9E, 0xC0, 0x1D, 0x8F, 0x38, 0x40, 0x54, 0x6D,
         ])
-        self.LuaHeaderHex = "1b4c7561540019930d0a1a0a040808785"
+        self.LuaHeader = bytes.fromhex("1b4c7561540019930d0a1a0a0408087856")
         self.OutputDir = str(output_dir)
+        self.JavaExecutable = os.path.abspath(java_executable) if java_executable else ""
+        if not self.JavaExecutable or not os.path.isfile(self.JavaExecutable):
+            raise RuntimeError("Java 环境未就绪，无法运行 unluac54.jar。")
+        self.UnluacJar = os.path.abspath("Tools/Decompile/unluac54.jar")
+        if not os.path.isfile(self.UnluacJar):
+            raise RuntimeError(f"缺少 Lua 5.4 反编译器: {self.UnluacJar}")
         self.TempDir = "TempCompiled"
         self.KeymasterUrl = "https://keymaster.fivem.net/api/validate"
         self.summary = {
@@ -615,33 +735,54 @@ class FiveMDecryptor:
         with open(tmp_path, "wb") as f:
             f.write(decrypted_buffer)
 
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        jar_path = os.path.abspath("Tools/Decompile/unluac54.jar")
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        bytecode_path = str(Path(output_path).with_suffix(".luac"))
+        name_only = os.path.splitext(os.path.basename(output_path))[0]
+        error_path = os.path.join(output_dir, f"error_{name_only}_unluac.txt")
+
+        def save_failure(status, detail):
+            full_detail = detail or "unluac 未返回错误详情"
+            with open(bytecode_path, "wb") as out:
+                out.write(decrypted_buffer)
+            with open(error_path, "w", encoding="utf-8", errors="ignore") as error_file:
+                error_file.write(full_detail)
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            message = f"Lua 反编译失败，字节码已保存为: {bytecode_path}，错误详情: {error_path}"
+            print_warning(message)
+            return {"status": status, "output": bytecode_path, "error": full_detail[:1600]}
+
         try:
             proc = subprocess.run(
-                ["java", "-jar", jar_path, tmp_path],
+                [self.JavaExecutable, "-jar", self.UnluacJar, tmp_path],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="ignore",
             )
             if proc.returncode != 0:
-                fname = os.path.basename(output_path)
-                name_only = os.path.splitext(fname)[0]
-                errfile = os.path.join(os.path.dirname(output_path), f"error_{name_only}_unluac.txt")
-                with open(errfile, "w", encoding="utf-8", errors="ignore") as ef:
-                    ef.write(proc.stderr or proc.stdout or "unluac 未返回错误详情")
-                print_warning(f"Lua 反编译失败，已写入错误文件: {errfile}")
-                return "decompile_error"
+                detail = (proc.stderr or proc.stdout or "unluac 未返回错误详情").strip()
+                return save_failure("decompile_error", detail)
+
+            source = proc.stdout or ""
+            if not source.strip():
+                return save_failure("decompile_error", "unluac 返回成功，但没有生成 Lua 源码。")
 
             with open(output_path, "w", encoding="utf-8", errors="ignore") as out:
-                out.write(proc.stdout)
-            return "decompiled"
+                out.write(source)
+            for stale_path in (bytecode_path, error_path):
+                if os.path.isfile(stale_path):
+                    try:
+                        os.remove(stale_path)
+                    except OSError:
+                        pass
+            return {"status": "decompiled", "output": output_path, "error": ""}
         except Exception as exc:
-            with open(output_path, "wb") as out:
-                out.write(decrypted_buffer)
-            print_warning(f"unluac 执行失败，已保存 Lua 字节码: {output_path}，原因: {exc}")
-            return "bytecode_saved"
+            return save_failure("java_error", f"unluac54.jar 执行失败: {exc}")
 
     def get_all_files(self, dirpath):
         results = []
@@ -669,7 +810,6 @@ class FiveMDecryptor:
                 return {"status": "failed", "file": relative_file, "error": "初始 FXAP 解密失败"}
 
             decrypted_buffer = self.decrypt_buffer(decrypted_file, decrypt_key)
-            alternative_key = self.calculate_client_key(grants_clk)
             if decrypted_buffer is None:
                 return {"status": "failed", "file": relative_file, "error": "资源数据解密失败"}
         except Exception as exc:
@@ -677,28 +817,70 @@ class FiveMDecryptor:
 
         try:
             if relative_file.lower().endswith(".lua"):
-                is_lua = decrypted_buffer.hex().startswith(self.LuaHeaderHex)
-                if is_lua:
-                    lua_status = self.process_lua_file(decrypted_buffer, output_path, resource_name, relative_file)
-                    return {"status": "decrypted", "file": relative_file, "output": output_path, "lua": lua_status}
+                output_dir = os.path.dirname(output_path)
+                os.makedirs(output_dir, exist_ok=True)
+                stale_paths = [
+                    output_path,
+                    str(Path(output_path).with_suffix(".luac")),
+                    os.path.join(output_dir, f"error_{Path(output_path).stem}_unluac.txt"),
+                ]
+                for stale_path in stale_paths:
+                    if os.path.isfile(stale_path):
+                        try:
+                            os.remove(stale_path)
+                        except OSError:
+                            pass
 
-                decrypted_alt = None
+                candidates = [("标准偏移/授权密钥", decrypted_buffer)]
+                candidate_errors = []
                 try:
-                    decrypted_alt = self.decrypt_buffer(decrypted_file, decrypt_key, bufferPtr=90, ivPtr=78)
-                except Exception:
-                    decrypted_alt = None
-
-                if decrypted_alt and decrypted_alt.hex().startswith(self.LuaHeaderHex):
-                    lua_status = self.process_lua_file(decrypted_alt, output_path, resource_name, relative_file)
-                    return {"status": "decrypted", "file": relative_file, "output": output_path, "lua": lua_status}
-
-                try:
-                    decrypted_alt2 = self.decrypt_buffer(decrypted_file, alternative_key)
-                    if decrypted_alt2:
-                        lua_status = self.process_lua_file(decrypted_alt2, output_path, resource_name, relative_file)
-                        return {"status": "decrypted", "file": relative_file, "output": output_path, "lua": lua_status}
+                    candidates.append((
+                        "备用偏移/授权密钥",
+                        self.decrypt_buffer(decrypted_file, decrypt_key, bufferPtr=90, ivPtr=78),
+                    ))
                 except Exception as exc:
-                    self.warn(item, f"Lua 备用解密失败: {relative_file}，{exc}")
+                    candidate_errors.append(f"备用偏移解密异常: {exc}")
+
+                try:
+                    alternative_key = self.calculate_client_key(grants_clk)
+                    candidates.append((
+                        "标准偏移/客户端密钥",
+                        self.decrypt_buffer(decrypted_file, alternative_key),
+                    ))
+                except Exception as exc:
+                    candidate_errors.append(f"客户端密钥解密异常: {exc}")
+
+                decompile_failures = []
+                last_result = None
+                for method, candidate in candidates:
+                    if not candidate or not candidate.startswith(self.LuaHeader):
+                        continue
+                    result = self.process_lua_file(candidate, output_path, resource_name, relative_file)
+                    if result.get("status") == "decompiled":
+                        return {
+                            "status": "decrypted",
+                            "file": relative_file,
+                            "output": result.get("output") or output_path,
+                            "lua": "decompiled",
+                            "lua_method": method,
+                        }
+                    last_result = result
+                    decompile_failures.append(f"{method}: {result.get('error') or result.get('status')}")
+
+                if decompile_failures:
+                    return {
+                        "status": "failed",
+                        "file": relative_file,
+                        "output": (last_result or {}).get("output", ""),
+                        "lua": (last_result or {}).get("status", "decompile_error"),
+                        "error": "Lua 5.4 字节码已解密，但 unluac54.jar 反编译失败: " + " | ".join(decompile_failures),
+                    }
+
+                detail = "；".join(candidate_errors)
+                error = "所有解密候选均未通过 Lua 5.4 文件头校验，未生成 .lua 文件。"
+                if detail:
+                    error += " " + detail
+                return {"status": "failed", "file": relative_file, "error": error}
 
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with open(output_path, "wb") as out:
@@ -885,6 +1067,7 @@ def parse_args(argv):
     parser.add_argument("--resources", default=None, help="资源选择，输入 all 或逗号分隔序号/资源名；非交互模式默认 all")
     parser.add_argument("--output", default="Output", help="解密输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
+    parser.add_argument("--java", default="", help="Java 安装目录或 java.exe；最低 Java 8，推荐 Java 17")
     parser.add_argument("--non-interactive", action="store_true", help="非交互模式，缺少必要信息时直接失败")
     parser.add_argument("--keep-temp", action="store_true", help="保留 Temp、Unpacked、TempCompiled、Resources 临时目录")
     return parser.parse_args(argv)
@@ -917,6 +1100,7 @@ def resolve_report_paths(report_arg, output_dir):
 def build_markdown_report(report):
     summary = report.get("summary", {})
     scope = report.get("scope", {})
+    java = report.get("java", {})
     lines = [
         "# 服务器 Dump 报告",
         "",
@@ -933,6 +1117,13 @@ def build_markdown_report(report):
         f"- 服务器 Dump: {'包含' if scope.get('serverDump') else '不包含'}",
         f"- FXAP 解密: {'包含' if scope.get('fxapDecrypt') else '不包含'}",
         f"- 模型修复: {'包含' if scope.get('modelRepair') else '不包含'}",
+        "",
+        "## Java 环境",
+        "",
+        f"- 状态: {'已就绪' if java.get('ok') else '不可用'}",
+        f"- 版本: {java.get('version', '')}",
+        f"- 路径: {java.get('path', '')}",
+        f"- 要求: 最低 Java {JAVA_MINIMUM_MAJOR}，推荐 Java {JAVA_RECOMMENDED_MAJOR}",
         "",
         "## 汇总",
         "",
@@ -1065,6 +1256,13 @@ def run_tool(args):
         "output": str(output_dir),
         "token_choice": args.token_choice,
         "resources_requested": args.resources or ("all" if args.non_interactive else ""),
+        "java": {
+            "ok": False,
+            "requested": args.java or "",
+            "path": "",
+            "version": "",
+            "major": None,
+        },
         "scope": {
             "serverDump": True,
             "fxapDecrypt": True,
@@ -1084,6 +1282,14 @@ def run_tool(args):
         print("=== FiveM 服务器 Dump 与 FXAP 解密工具 ===")
         print("功能范围: 包含服务器 Dump、FXAP 解密；不包含模型修复。")
         print()
+
+        emit_progress(2, "java", "正在检测 Java 环境。")
+        java_info = resolve_java_executable(args.java)
+        java_info["requested"] = args.java or ""
+        report["java"] = java_info
+        print(f"[Java] 已就绪: {java_info['version']} ({java_info['path']})")
+        if int(java_info.get("major", 0)) < JAVA_RECOMMENDED_MAJOR:
+            print(f"[Java] 当前版本可用，推荐升级到 Java {JAVA_RECOMMENDED_MAJOR}。")
 
         target = (args.target or "").strip()
         if not target and not args.non_interactive:
@@ -1121,7 +1327,7 @@ def run_tool(args):
 
         try:
             emit_progress(62, "fxap", "开始 FXAP 解密。")
-            decryptor = FiveMDecryptor(output_dir=str(output_dir))
+            decryptor = FiveMDecryptor(output_dir=str(output_dir), java_executable=java_info["path"])
             decrypt_resources = decryptor.start()
             report["decrypt_summary"] = decryptor.summary
             report["decrypt_resources"] = decrypt_resources
