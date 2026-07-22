@@ -3,6 +3,7 @@ import base64
 import ctypes
 import ctypes.wintypes as wintypes
 import errno
+from fnmatch import fnmatchcase
 import hashlib
 import hmac
 import ipaddress
@@ -27,7 +28,7 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.4"
+TOOL_VERSION = "1.1.5"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -118,7 +119,6 @@ def mask_token(token):
     return token[:8] + "..." + token[-4:]
 
 
-
 def get_file_hash(file_data):
     if not file_data:
         return ""
@@ -135,6 +135,83 @@ def encode_file_path(file_name):
         for segment in str(file_name).replace("\\", "/").split("/")
         if segment
     )
+
+
+def resource_pattern_matches(resource_name, pattern):
+    name = str(resource_name or "")
+    expression = str(pattern or "").strip()
+    if not expression:
+        return False
+    if name.casefold() == expression.casefold():
+        return True
+    return fnmatchcase(name.casefold(), expression.casefold())
+
+
+def resolve_resource_selection(resources, choice):
+    exact_names = isinstance(choice, (list, tuple, set))
+    if exact_names:
+        tokens = [str(value).strip() for value in choice if str(value).strip()]
+    else:
+        tokens = [value.strip() for value in str(choice or "").split(",") if value.strip()]
+
+    selected = []
+    selected_indexes = set()
+    unmatched = []
+    for token in tokens:
+        matches = []
+        if exact_names:
+            matches = [
+                index for index, resource in enumerate(resources)
+                if str(resource.get("name", "")).casefold() == token.casefold()
+            ]
+        elif token.casefold() == "all":
+            matches = list(range(len(resources)))
+        elif token.isdigit():
+            index = int(token)
+            if 0 <= index < len(resources):
+                matches = [index]
+        else:
+            exact_matches = [
+                index for index, resource in enumerate(resources)
+                if str(resource.get("name", "")).casefold() == token.casefold()
+            ]
+            matches = exact_matches or [
+                index for index, resource in enumerate(resources)
+                if resource_pattern_matches(resource.get("name", ""), token)
+            ]
+
+        if not matches:
+            unmatched.append(token)
+            continue
+        for index in matches:
+            if index in selected_indexes:
+                continue
+            selected_indexes.add(index)
+            selected.append(resources[index])
+    return selected, unmatched
+
+
+def load_resource_selection_file(file_path):
+    path = Path(file_path).expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"Resource selection file does not exist: {path}")
+    if path.stat().st_size > 1024 * 1024:
+        raise RuntimeError(f"Resource selection file is too large: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"Unable to read resource selection file {path}: {exc}") from exc
+    values = payload.get("resources") if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        raise RuntimeError("Resource selection file must contain a resources array")
+    names = [value.strip() for value in values if isinstance(value, str) and value.strip()]
+    if not names:
+        raise RuntimeError("Resource selection file does not contain any resource names")
+    if len(names) > 10000:
+        raise RuntimeError("Resource selection file contains too many resource names")
+    return names
+
+
 def print_warning(message):
     print(f"[警告] {message}", flush=True)
 
@@ -144,6 +221,10 @@ def print_error(message):
 
 
 class DiskSpaceError(RuntimeError):
+    pass
+
+
+class ResourceSelectionCancelled(RuntimeError):
     pass
 
 
@@ -497,7 +578,7 @@ class FiveMDumper:
         key = bytes([0x69] * 16)
         return bytes(b ^ key[i % 16] for i, b in enumerate(data[:32]))
 
-    def get_configuration(self):
+    def get_configuration(self, save_grants=True):
         emit_progress(22, "server_config", "正在向服务器请求资源配置。")
         url = f"{self.base_url}/client"
         data = {"method": "getConfiguration"}
@@ -505,11 +586,12 @@ class FiveMDumper:
         resp.raise_for_status()
         js = resp.json()
 
-        if self.work_guard:
-            self.work_guard.check(required_bytes=1024 * 1024, force=True)
-        os.makedirs("Resources", exist_ok=True)
-        with open("Resources/Grants.txt", "w", encoding="utf-8") as f:
-            f.write(js.get("grants_token", ""))
+        if save_grants:
+            if self.work_guard:
+                self.work_guard.check(required_bytes=1024 * 1024, force=True)
+            os.makedirs("Resources", exist_ok=True)
+            with open("Resources/Grants.txt", "w", encoding="utf-8") as f:
+                f.write(js.get("grants_token", ""))
         resources = js.get("resources", []) or []
         self.summary["resources_total"] = len(resources)
         print(f"[配置] 服务器返回 {len(resources)} 个资源。")
@@ -724,32 +806,61 @@ class FiveMDumper:
         self.resource_reports.append(item)
         return item
 
+    def print_resource_menu(self, resources):
+        print(f"[资源菜单] 共 {len(resources)} 个资源")
+        width = max(1, len(str(max(0, len(resources) - 1))))
+        for index, resource in enumerate(resources):
+            print(f"  {index:>{width}}  {resource.get('name', '')}")
+
+    def print_resource_selection(self, selected):
+        print(f"[资源选择] 已选 {len(selected)} 个资源:")
+        for resource in selected[:200]:
+            print(f"  - {resource.get('name', '')}")
+        if len(selected) > 200:
+            print(f"  ... 另有 {len(selected) - 200} 个资源")
+
     def select_resources(self, resources, choice):
-        print("[资源列表]")
-        for i, res in enumerate(resources):
-            print(f"{i}: {res.get('name', '')}")
+        if isinstance(choice, (list, tuple, set)):
+            selected, unmatched = resolve_resource_selection(resources, choice)
+            if unmatched:
+                detail = ", ".join(unmatched[:20])
+                raise RuntimeError(f"Confirmed resources are no longer available: {detail}")
+            self.print_resource_selection(selected)
+            return selected
 
         choice = (choice or "").strip()
-        if not choice:
-            choice = input("请选择资源序号（例如 2,6,22）或输入 all 处理全部: ").strip()
-        if choice.lower() == "all":
-            return list(resources)
+        if choice:
+            selected, unmatched = resolve_resource_selection(resources, choice)
+            for token in unmatched:
+                print_warning(f"Resource selector matched nothing and was ignored: {token}")
+            self.print_resource_selection(selected)
+            return selected
 
-        selected = []
-        for part in [x.strip() for x in choice.split(",") if x.strip()]:
-            if part.isdigit():
-                idx = int(part)
-                if 0 <= idx < len(resources):
-                    selected.append(resources[idx])
-                else:
-                    print_warning(f"资源序号越界，已忽略: {part}")
-            else:
-                match = next((res for res in resources if res.get("name") == part), None)
-                if match:
-                    selected.append(match)
-                else:
-                    print_warning(f"未找到资源名，已忽略: {part}")
-        return selected
+        self.print_resource_menu(resources)
+        while True:
+            expression = input(
+                "请输入资源序号、精确名称或通配符（如 esx_*,*_cars），"
+                "多个条件用逗号分隔；all 全选，q 取消: "
+            ).strip()
+            if expression.casefold() in ("q", "quit", "cancel"):
+                raise ResourceSelectionCancelled("Resource selection cancelled by user")
+
+            selected, unmatched = resolve_resource_selection(resources, expression)
+            for token in unmatched:
+                print_warning(f"未匹配到资源，已忽略: {token}")
+            if not selected:
+                print_warning("没有匹配到任何资源，请重新选择。")
+                continue
+
+            self.print_resource_selection(selected)
+            confirmation = input(
+                f"确认 Dump 以上 {len(selected)} 个资源？[y]确认 / [r]重选 / [q]取消: "
+            ).strip().casefold()
+            if confirmation in ("y", "yes", "是", "确认"):
+                return selected
+            if confirmation in ("q", "quit", "cancel", "取消"):
+                raise ResourceSelectionCancelled("Resource selection cancelled by user")
+            print("[资源选择] 已返回资源菜单，请重新选择。")
 
     def cleanup_resource_temp(self, resource_safe_name):
         for root_name in ("Temp", "Unpacked", "TempCompiled"):
@@ -767,8 +878,7 @@ class FiveMDumper:
         self.summary["resources_selected"] = len(chosen)
 
         if not chosen:
-            print_warning("没有选择任何资源，跳过 Dump。")
-            return self.resource_reports
+            raise RuntimeError("No resources matched the requested selection")
 
         print(f"[Dump] 将处理 {len(chosen)} 个资源，并在每个资源完成后立即解密和释放临时文件。")
         for idx, res in enumerate(chosen, start=1):
@@ -1672,7 +1782,9 @@ def parse_args(argv):
     parser.add_argument("target", nargs="?", help="cfx.re 链接或 IP:端口，例如 https://cfx.re/join/xxxx 或 1.2.3.4:30120")
     parser.add_argument("--token-choice", choices=["1", "2"], default="1", help="1 自动扫描 FiveM token，2 使用手动 token")
     parser.add_argument("--token", default="", help="手动 token；token-choice=2 时使用，也可作为自动扫描失败后的备用 token")
-    parser.add_argument("--resources", default=None, help="资源选择，输入 all 或逗号分隔序号/资源名；非交互模式默认 all")
+    parser.add_argument("--resources", default=None, help="资源选择：支持 all、序号、精确名称和 *、? 通配符，多个条件用逗号分隔；非交互模式默认 all")
+    parser.add_argument("--resources-file", default="", help="包含精确资源名数组的 JSON 文件")
+    parser.add_argument("--list-resources", action="store_true", help="仅获取并输出服务器资源清单，不执行 Dump")
     parser.add_argument("--output", default="Output", help="解密输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
     parser.add_argument("--java", default="", help="Java 安装目录或 java.exe；最低 Java 8，推荐 Java 17")
@@ -1854,6 +1966,49 @@ def choose_token(args):
     return token
 
 
+def run_resource_listing(args):
+    os.chdir(SCRIPT_DIR)
+    payload = {
+        "schemaVersion": 1,
+        "version": TOOL_VERSION,
+        "command": "list-resources",
+        "status": "error",
+        "target": args.target or "",
+        "server_address": "",
+        "resources": [],
+        "error": "",
+    }
+    try:
+        target = (args.target or "").strip()
+        if not target and not args.non_interactive:
+            target = input("Enter a cfx.re link or IP:port: ").strip()
+        if not target:
+            raise RuntimeError("Target address is required")
+        payload["target"] = target
+
+        token = choose_token(args)
+        emit_progress(15, "resolve", "Resolving server address")
+        server_address = get_ip_from_cfx(target)
+        payload["server_address"] = server_address
+
+        dumper = FiveMDumper("https://" + server_address, token, max_workers=1)
+        resources = dumper.get_configuration(save_grants=False)
+        payload["resources"] = [
+            {"index": index, "name": str(resource.get("name", ""))}
+            for index, resource in enumerate(resources)
+        ]
+        payload["status"] = "success"
+        emit_progress(100, "resource_list", f"Loaded {len(resources)} resources")
+    except Exception as exc:
+        payload["error"] = str(exc)
+        print_error(payload["error"])
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    print("CK_RESOURCE_LIST " + serialized, flush=True)
+    print(serialized, flush=True)
+    return 0 if payload["status"] == "success" else 2
+
+
 def run_tool(args):
     os.chdir(SCRIPT_DIR)
     start_time = time.time()
@@ -1883,7 +2038,7 @@ def run_tool(args):
         "base_url": "",
         "output": str(output_dir),
         "token_choice": args.token_choice,
-        "resources_requested": args.resources or ("all" if args.non_interactive else ""),
+        "resources_requested": args.resources_file or args.resources or ("all" if args.non_interactive else ""),
         "java": {
             "ok": False,
             "requested": args.java or "",
@@ -1979,7 +2134,7 @@ def run_tool(args):
             raise RuntimeError("缺少目标地址，请输入 cfx.re 链接或 IP:端口。")
         report["target"] = target
 
-        resources_choice = args.resources
+        resources_choice = load_resource_selection_file(args.resources_file) if args.resources_file else args.resources
         if args.non_interactive and not resources_choice:
             resources_choice = "all"
         report["resources_requested"] = resources_choice or ""
@@ -2016,6 +2171,12 @@ def run_tool(args):
         emit_progress(88, "fxap", "逐资源 FXAP 解密阶段完成。")
         print("[FXAP] FXAP 解密流程结束。")
 
+    except ResourceSelectionCancelled as exc:
+        exit_code = 3
+        report["status"] = "cancelled"
+        message = str(exc)
+        report["warnings"].append(message)
+        print_warning(message)
     except DiskSpaceError as exc:
         exit_code = 12
         report["status"] = "error"
@@ -2075,8 +2236,11 @@ def run_tool(args):
 
     return exit_code
 
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.list_resources:
+        return run_resource_listing(args)
     return run_tool(args)
 
 

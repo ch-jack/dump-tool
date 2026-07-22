@@ -64,6 +64,22 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources all --output Output --
 python auto.py 1.2.3.4:30120 --token-choice 2 --token YOUR_TOKEN
 ```
 
+## 两步资源选择
+
+只获取服务器资源清单，不创建输出或执行 Dump：
+
+```bat
+python auto.py 1.2.3.4:30120 --token-choice 1 --list-resources --non-interactive
+```
+
+正式 Dump 支持序号、精确资源名以及 `*`、`?` 通配符，多个条件用逗号分隔：
+
+```bat
+python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-interactive
+```
+
+不传 `--resources` 且使用交互模式时，程序会在获取清单后显示编号菜单，预览匹配结果并要求确认。CK 工具箱使用独立的“获取资源清单”步骤，在菜单确认后通过 `--resources-file` 将精确资源名传给正式 Dump。
+
 ## 输出
 
 - 解密后的文件默认写入 `Output`
