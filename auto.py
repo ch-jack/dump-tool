@@ -2,6 +2,7 @@ import argparse
 import base64
 import ctypes
 import ctypes.wintypes as wintypes
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -25,9 +27,10 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.1"
+TOOL_VERSION = "1.1.2"
 SCRIPT_DIR = Path(__file__).resolve().parent
-TEMP_FOLDERS = ["Temp", "Unpacked", "TempCompiled", "Resources"]
+DEFAULT_MIN_FREE_GB = 5.0
+BYTES_PER_GB = 1024 ** 3
 JAVA_MINIMUM_MAJOR = 8
 JAVA_RECOMMENDED_MAJOR = 17
 
@@ -115,6 +118,82 @@ def print_warning(message):
 
 def print_error(message):
     print(f"[错误] {message}", flush=True)
+
+
+class DiskSpaceError(RuntimeError):
+    pass
+
+
+def format_gb(value):
+    return round(max(0, int(value)) / BYTES_PER_GB, 2)
+
+
+def is_disk_full_error(exc):
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "errno", None) == errno.ENOSPC or getattr(exc, "winerror", None) == 112:
+        return True
+    text = str(exc).lower()
+    return "no space left on device" in text or "磁盘空间不足" in text
+
+
+class DiskSpaceGuard:
+    def __init__(self, path, min_free_gb=DEFAULT_MIN_FREE_GB, label="磁盘"):
+        self.path = Path(path).resolve()
+        self.label = str(label)
+        self.reserve_bytes = max(BYTES_PER_GB, int(float(min_free_gb) * BYTES_PER_GB))
+        self._lock = threading.Lock()
+        self._last_check = 0.0
+        self._last_free = None
+
+    def check(self, required_bytes=0, force=False):
+        required_bytes = max(0, int(required_bytes or 0))
+        with self._lock:
+            now = time.monotonic()
+            if force or self._last_free is None or now - self._last_check >= 0.5:
+                usage = shutil.disk_usage(str(self.path))
+                self._last_free = int(usage.free)
+                self._last_check = now
+            free_bytes = int(self._last_free)
+
+        required_total = self.reserve_bytes + required_bytes
+        if free_bytes < required_total:
+            raise DiskSpaceError(
+                f"{self.label}空间不足：当前剩余 {format_gb(free_bytes)} GB，"
+                f"继续操作至少需要保留 {format_gb(required_total)} GB。路径: {self.path}"
+            )
+        return {
+            "path": str(self.path),
+            "free_bytes": free_bytes,
+            "free_gb": format_gb(free_bytes),
+            "minimum_free_gb": format_gb(self.reserve_bytes),
+        }
+
+    def raise_write_error(self, exc):
+        try:
+            self.check(force=True)
+        except DiskSpaceError as space_exc:
+            raise space_exc from exc
+        raise DiskSpaceError(
+            f"{self.label}写入失败，磁盘或配额空间不足。路径: {self.path}；系统错误: {exc}"
+        ) from exc
+
+
+def create_work_dir(temp_base, output_dir):
+    output_dir = Path(output_dir).resolve()
+    if temp_base:
+        base = Path(temp_base).expanduser()
+        if not base.is_absolute():
+            base = output_dir.parent / base
+    else:
+        base = output_dir.parent
+    base = base.resolve()
+    base.mkdir(parents=True, exist_ok=True)
+
+    run_name = f"_ck_dump_temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    work_dir = base / run_name
+    work_dir.mkdir(parents=True, exist_ok=False)
+    return work_dir
 
 
 def parse_java_major(version_text):
@@ -359,13 +438,15 @@ def get_ip_from_cfx(target):
 
 
 class FiveMDumper:
-    def __init__(self, base_url, token, max_workers=10):
+    def __init__(self, base_url, token, max_workers=10, work_guard=None, keep_temp=False):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update({"X-CitizenFX-Token": token, "User-Agent": "CitizenFX/1"})
         self.max_workers = max_workers
+        self.work_guard = work_guard
+        self.keep_temp = bool(keep_temp)
         self.summary = {
             "resources_total": 0,
             "resources_selected": 0,
@@ -401,6 +482,8 @@ class FiveMDumper:
         resp.raise_for_status()
         js = resp.json()
 
+        if self.work_guard:
+            self.work_guard.check(required_bytes=1024 * 1024, force=True)
         os.makedirs("Resources", exist_ok=True)
         with open("Resources/Grants.txt", "w", encoding="utf-8") as f:
             f.write(js.get("grants_token", ""))
@@ -428,17 +511,27 @@ class FiveMDumper:
                 print_warning(f"{file_name} 的 RPF 文件头不完整，继续保存并尝试后续处理。")
 
             try:
+                if self.work_guard:
+                    self.work_guard.check(required_bytes=len(dec))
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 with open(out_path, "wb") as f:
                     f.write(dec)
                 return {"path": out_path, "file": file_name, "bytes": len(dec), "error": ""}
+            except DiskSpaceError:
+                raise
+            except OSError as exc:
+                if is_disk_full_error(exc) and self.work_guard:
+                    self.work_guard.raise_write_error(exc)
+                return {"path": None, "file": file_name, "error": f"写入文件失败: {exc}"}
             except Exception as exc:
                 return {"path": None, "file": file_name, "error": f"写入文件失败: {exc}"}
+        except DiskSpaceError:
+            raise
         except Exception as exc:
             return {"path": None, "file": file_name, "error": f"下载失败: {exc}"}
 
     def unpack_rpf(self, rpf_path, out_dir, item):
-        unpacker = os.path.abspath("Bin/Unpacker.exe")
+        unpacker = str((SCRIPT_DIR / "Bin" / "Unpacker.exe").resolve())
         rpf_path = os.path.abspath(rpf_path)
         out_dir = os.path.abspath(out_dir)
 
@@ -446,6 +539,8 @@ class FiveMDumper:
             self.warn(item, f"未找到 Bin/Unpacker.exe，跳过 RPF 解包: {os.path.basename(rpf_path)}")
             return False
 
+        if self.work_guard:
+            self.work_guard.check(force=True)
         os.makedirs(out_dir, exist_ok=True)
         try:
             proc = subprocess.run(
@@ -459,6 +554,8 @@ class FiveMDumper:
                 print(proc.stdout.strip())
             if proc.stderr.strip():
                 print("[Unpacker stderr] " + proc.stderr.strip())
+            if self.work_guard:
+                self.work_guard.check(force=True)
 
             extracted = "Extraído:" in proc.stdout or "Extracted:" in proc.stdout or proc.returncode == 0
             if extracted:
@@ -470,6 +567,8 @@ class FiveMDumper:
 
             self.warn(item, f"RPF 解包失败: {os.path.basename(rpf_path)}，退出码 {proc.returncode}。")
             return False
+        except DiskSpaceError:
+            raise
         except Exception as exc:
             self.warn(item, f"RPF 解包异常: {os.path.basename(rpf_path)}，{exc}")
             return False
@@ -495,6 +594,8 @@ class FiveMDumper:
     def fetch_resource(self, res, index, total):
         resource_name = res.get("name", f"resource_{index}")
         res_name = safe_name(resource_name)
+        if self.work_guard:
+            self.work_guard.check(force=True)
         item = {
             "name": resource_name,
             "safe_name": res_name,
@@ -552,6 +653,10 @@ class FiveMDumper:
                 completed += 1
                 try:
                     result = future.result()
+                except DiskSpaceError:
+                    for pending in future_map:
+                        pending.cancel()
+                    raise
                 except Exception as exc:
                     result = {"path": None, "file": fname, "error": str(exc)}
 
@@ -614,7 +719,17 @@ class FiveMDumper:
                     print_warning(f"未找到资源名，已忽略: {part}")
         return selected
 
-    def run(self, resources_choice=None):
+    def cleanup_resource_temp(self, resource_safe_name):
+        for root_name in ("Temp", "Unpacked", "TempCompiled"):
+            path = os.path.join(root_name, resource_safe_name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                shutil.rmtree(path)
+            except Exception as exc:
+                print_warning(f"无法清理资源临时目录 {path}: {exc}")
+
+    def run(self, resources_choice=None, on_resource_ready=None):
         resources = self.get_configuration()
         chosen = self.select_resources(resources, resources_choice)
         self.summary["resources_selected"] = len(chosen)
@@ -623,14 +738,23 @@ class FiveMDumper:
             print_warning("没有选择任何资源，跳过 Dump。")
             return self.resource_reports
 
-        print(f"[Dump] 将处理 {len(chosen)} 个资源。")
+        print(f"[Dump] 将处理 {len(chosen)} 个资源，并在每个资源完成后立即解密和释放临时文件。")
         for idx, res in enumerate(chosen, start=1):
-            self.fetch_resource(res, idx, len(chosen))
+            resource_name = res.get("name", f"resource_{idx}")
+            resource_safe_name = safe_name(resource_name)
+            try:
+                item = self.fetch_resource(res, idx, len(chosen))
+                unpacked_dir = os.path.join("Unpacked", resource_safe_name)
+                if on_resource_ready and os.path.isdir(unpacked_dir):
+                    on_resource_ready(unpacked_dir, resource_safe_name)
+            finally:
+                if not self.keep_temp:
+                    self.cleanup_resource_temp(resource_safe_name)
         return self.resource_reports
 
 
 class FiveMDecryptor:
-    def __init__(self, output_dir="Output", java_executable=""):
+    def __init__(self, output_dir="Output", java_executable="", work_guard=None, output_guard=None):
         self.DefaultKey = bytes([
             0xB3, 0xCB, 0x2E, 0x04, 0x87, 0x94, 0xD6, 0x73,
             0x08, 0x23, 0xC4, 0x93, 0x7A, 0xBD, 0x18, 0xAD,
@@ -646,10 +770,12 @@ class FiveMDecryptor:
         ])
         self.LuaHeader = bytes.fromhex("1b4c7561540019930d0a1a0a0408087856")
         self.OutputDir = str(output_dir)
+        self.WorkGuard = work_guard
+        self.OutputGuard = output_guard
         self.JavaExecutable = os.path.abspath(java_executable) if java_executable else ""
         if not self.JavaExecutable or not os.path.isfile(self.JavaExecutable):
             raise RuntimeError("Java 环境未就绪，无法运行 unluac54.jar。")
-        self.UnluacJar = os.path.abspath("Tools/Decompile/unluac54.jar")
+        self.UnluacJar = str((SCRIPT_DIR / "Tools" / "Decompile" / "unluac54.jar").resolve())
         if not os.path.isfile(self.UnluacJar):
             raise RuntimeError(f"缺少 Lua 5.4 反编译器: {self.UnluacJar}")
         self.TempDir = "TempCompiled"
@@ -731,6 +857,8 @@ class FiveMDecryptor:
 
     def process_lua_file(self, decrypted_buffer: bytes, output_path: str, resource_name: str, file_rel: str):
         tmp_path = os.path.join(self.TempDir, f"{resource_name}/{file_rel}c")
+        if self.WorkGuard:
+            self.WorkGuard.check(required_bytes=len(decrypted_buffer))
         os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
         with open(tmp_path, "wb") as f:
             f.write(decrypted_buffer)
@@ -743,6 +871,8 @@ class FiveMDecryptor:
 
         def save_failure(status, detail):
             full_detail = detail or "unluac 未返回错误详情"
+            if self.OutputGuard:
+                self.OutputGuard.check(required_bytes=len(decrypted_buffer) + len(full_detail.encode("utf-8", errors="ignore")))
             with open(bytecode_path, "wb") as out:
                 out.write(decrypted_buffer)
             with open(error_path, "w", encoding="utf-8", errors="ignore") as error_file:
@@ -772,6 +902,8 @@ class FiveMDecryptor:
             if not source.strip():
                 return save_failure("decompile_error", "unluac 返回成功，但没有生成 Lua 源码。")
 
+            if self.OutputGuard:
+                self.OutputGuard.check(required_bytes=len(source.encode("utf-8", errors="ignore")))
             with open(output_path, "w", encoding="utf-8", errors="ignore") as out:
                 out.write(source)
             for stale_path in (bytecode_path, error_path):
@@ -781,6 +913,8 @@ class FiveMDecryptor:
                     except OSError:
                         pass
             return {"status": "decompiled", "output": output_path, "error": ""}
+        except DiskSpaceError:
+            raise
         except Exception as exc:
             return save_failure("java_error", f"unluac54.jar 执行失败: {exc}")
 
@@ -800,6 +934,8 @@ class FiveMDecryptor:
                 return {"status": "missing", "file": relative_file, "error": "文件不存在"}
 
             if not self.verify_encrypted(full_path):
+                if self.OutputGuard:
+                    self.OutputGuard.check(required_bytes=os.path.getsize(full_path))
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 with open(full_path, "rb") as inf, open(output_path, "wb") as outf:
                     outf.write(inf.read())
@@ -812,6 +948,12 @@ class FiveMDecryptor:
             decrypted_buffer = self.decrypt_buffer(decrypted_file, decrypt_key)
             if decrypted_buffer is None:
                 return {"status": "failed", "file": relative_file, "error": "资源数据解密失败"}
+        except DiskSpaceError:
+            raise
+        except OSError as exc:
+            if is_disk_full_error(exc) and self.OutputGuard:
+                self.OutputGuard.raise_write_error(exc)
+            return {"status": "failed", "file": relative_file, "error": f"处理异常: {exc}"}
         except Exception as exc:
             return {"status": "failed", "file": relative_file, "error": f"处理异常: {exc}"}
 
@@ -882,10 +1024,18 @@ class FiveMDecryptor:
                     error += " " + detail
                 return {"status": "failed", "file": relative_file, "error": error}
 
+            if self.OutputGuard:
+                self.OutputGuard.check(required_bytes=len(decrypted_buffer))
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with open(output_path, "wb") as out:
                 out.write(decrypted_buffer)
             return {"status": "decrypted", "file": relative_file, "output": output_path}
+        except DiskSpaceError:
+            raise
+        except OSError as exc:
+            if is_disk_full_error(exc) and self.OutputGuard:
+                self.OutputGuard.raise_write_error(exc)
+            return {"status": "failed", "file": relative_file, "error": f"写入失败: {exc}"}
         except Exception as exc:
             return {"status": "failed", "file": relative_file, "error": f"写入失败: {exc}"}
 
@@ -900,10 +1050,20 @@ class FiveMDecryptor:
             try:
                 relative = os.path.relpath(file_full, resource_path).replace("\\", "/")
                 output_path = os.path.join(self.OutputDir, resource_name, relative)
+                if self.OutputGuard:
+                    self.OutputGuard.check(required_bytes=os.path.getsize(file_full))
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 with open(file_full, "rb") as inf, open(output_path, "wb") as outf:
                     outf.write(inf.read())
                 copied += 1
+            except DiskSpaceError:
+                raise
+            except OSError as exc:
+                if is_disk_full_error(exc) and self.OutputGuard:
+                    self.OutputGuard.raise_write_error(exc)
+                item["failed_files"] += 1
+                self.summary["failed_files"] += 1
+                self.warn(item, f"复制文件失败: {os.path.basename(file_full)}，{exc}")
             except Exception as exc:
                 item["failed_files"] += 1
                 self.summary["failed_files"] += 1
@@ -914,6 +1074,9 @@ class FiveMDecryptor:
         print(f"[复制完成] 未加密资源已复制: {resource_name}，文件 {copied} 个。")
 
     def decrypt_resource(self, resource_path, resource_name, grants_token=None):
+        self.summary["resources_total"] += 1
+        if self.OutputGuard:
+            self.OutputGuard.check(force=True)
         item = {
             "name": resource_name,
             "status": "pending",
@@ -994,6 +1157,10 @@ class FiveMDecryptor:
                 for task in as_completed(tasks):
                     try:
                         result = task.result()
+                    except DiskSpaceError:
+                        for pending in tasks:
+                            pending.cancel()
+                        raise
                     except Exception as exc:
                         result = {"status": "failed", "file": "", "error": str(exc)}
 
@@ -1018,6 +1185,8 @@ class FiveMDecryptor:
 
             self.resource_reports.append(item)
             return item
+        except DiskSpaceError:
+            raise
         except Exception as exc:
             self.error(item, f"资源处理异常: {resource_name}，{exc}")
             item["status"] = "failed"
@@ -1036,7 +1205,6 @@ class FiveMDecryptor:
             if os.path.isdir(full):
                 resource_dirs.append(full)
 
-        self.summary["resources_total"] = len(resource_dirs)
         if not resource_dirs:
             print_warning("Unpacked/ 中没有可解密资源。")
             return self.resource_reports
@@ -1068,8 +1236,10 @@ def parse_args(argv):
     parser.add_argument("--output", default="Output", help="解密输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
     parser.add_argument("--java", default="", help="Java 安装目录或 java.exe；最低 Java 8，推荐 Java 17")
+    parser.add_argument("--temp-dir", default="", help="临时工作区的父目录；默认使用输出目录所在磁盘")
+    parser.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB, help="输出与临时磁盘必须保留的最小空间（GB）")
     parser.add_argument("--non-interactive", action="store_true", help="非交互模式，缺少必要信息时直接失败")
-    parser.add_argument("--keep-temp", action="store_true", help="保留 Temp、Unpacked、TempCompiled、Resources 临时目录")
+    parser.add_argument("--keep-temp", action="store_true", help="保留本次运行的临时工作区；默认逐资源处理后清理")
     return parser.parse_args(argv)
 
 
@@ -1101,6 +1271,7 @@ def build_markdown_report(report):
     summary = report.get("summary", {})
     scope = report.get("scope", {})
     java = report.get("java", {})
+    storage = report.get("storage", {})
     lines = [
         "# 服务器 Dump 报告",
         "",
@@ -1117,6 +1288,16 @@ def build_markdown_report(report):
         f"- 服务器 Dump: {'包含' if scope.get('serverDump') else '不包含'}",
         f"- FXAP 解密: {'包含' if scope.get('fxapDecrypt') else '不包含'}",
         f"- 模型修复: {'包含' if scope.get('modelRepair') else '不包含'}",
+        "",
+        "## 存储与临时目录",
+        "",
+        f"- 输出目录: {storage.get('output_dir', report.get('output', ''))}",
+        f"- 临时工作区: {storage.get('temp_dir', '')}",
+        f"- 临时策略: {'保留' if storage.get('temp_kept') else '逐资源解密后立即清理'}",
+        f"- 最小保留空间: {storage.get('minimum_free_gb', DEFAULT_MIN_FREE_GB)} GB",
+        f"- 启动时输出盘剩余: {storage.get('output_initial_free_gb', '')} GB",
+        f"- 启动时临时盘剩余: {storage.get('temp_initial_free_gb', '')} GB",
+        f"- 结束时输出盘剩余: {storage.get('output_final_free_gb', '')} GB",
         "",
         "## Java 环境",
         "",
@@ -1191,19 +1372,20 @@ def write_reports(report, json_path, markdown_path):
     print("CK_REPORT " + json.dumps(report["execution_report"], ensure_ascii=False), flush=True)
 
 
-def cleanup_temp(keep_temp):
+def cleanup_temp(work_dir, keep_temp):
+    work_dir = Path(work_dir).resolve()
+    os.chdir(SCRIPT_DIR)
     if keep_temp:
-        print("[清理] 已按参数保留临时目录。")
+        print(f"[清理] 已按参数保留本次临时工作区: {work_dir}")
         return
 
-    emit_progress(96, "cleanup", "正在清理临时目录。")
-    for folder in TEMP_FOLDERS:
-        if os.path.isdir(folder):
-            try:
-                shutil.rmtree(folder)
-                print(f"[清理] 已删除 {folder}/")
-            except Exception as exc:
-                print_warning(f"无法删除 {folder}/: {exc}")
+    if not work_dir.name.startswith("_ck_dump_temp_"):
+        raise RuntimeError(f"拒绝清理非本工具临时目录: {work_dir}")
+
+    emit_progress(96, "cleanup", "正在清理本次临时工作区。")
+    if work_dir.is_dir():
+        shutil.rmtree(work_dir)
+        print(f"[清理] 已删除本次临时工作区: {work_dir}")
 
 
 def choose_token(args):
@@ -1240,8 +1422,14 @@ def run_tool(args):
     output_dir = Path(args.output)
     if not output_dir.is_absolute():
         output_dir = SCRIPT_DIR / output_dir
+    output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path, markdown_path = resolve_report_paths(args.report, output_dir)
+
+    minimum_free_gb = max(1.0, float(args.min_free_gb or DEFAULT_MIN_FREE_GB))
+    work_dir = create_work_dir(args.temp_dir, output_dir)
+    output_guard = DiskSpaceGuard(output_dir, minimum_free_gb, "输出目录磁盘")
+    work_guard = DiskSpaceGuard(work_dir, minimum_free_gb, "临时工作区磁盘")
 
     report = {
         "version": TOOL_VERSION,
@@ -1263,6 +1451,15 @@ def run_tool(args):
             "version": "",
             "major": None,
         },
+        "storage": {
+            "output_dir": str(output_dir),
+            "temp_dir": str(work_dir),
+            "temp_kept": bool(args.keep_temp),
+            "minimum_free_gb": minimum_free_gb,
+            "output_initial_free_gb": "",
+            "temp_initial_free_gb": "",
+            "output_final_free_gb": "",
+        },
         "scope": {
             "serverDump": True,
             "fxapDecrypt": True,
@@ -1278,9 +1475,53 @@ def run_tool(args):
     }
 
     exit_code = 0
+    dumper = None
+    decryptor = None
+
+    def update_report_summaries():
+        if dumper is not None:
+            report["dump_summary"] = dumper.summary
+            report["dump_resources"] = dumper.resource_reports
+        if decryptor is not None:
+            report["decrypt_summary"] = decryptor.summary
+            report["decrypt_resources"] = decryptor.resource_reports
+
+        dump_summary = report.get("dump_summary") or {}
+        decrypt_summary = report.get("decrypt_summary") or {}
+        failed_files = int(dump_summary.get("failed_files", 0)) + int(decrypt_summary.get("failed_files", 0))
+        warnings = int(dump_summary.get("warnings", 0)) + int(decrypt_summary.get("warnings", 0)) + len(report["warnings"])
+        errors = int(dump_summary.get("errors", 0)) + int(decrypt_summary.get("errors", 0)) + len(report["errors"])
+        report["summary"] = {
+            "server_resources_total": int(dump_summary.get("resources_total", 0)),
+            "server_resources_selected": int(dump_summary.get("resources_selected", 0)),
+            "downloaded_files": int(dump_summary.get("downloaded_files", 0)),
+            "rpf_unpacked": int(dump_summary.get("rpf_unpacked", 0)),
+            "resources_decrypted": int(decrypt_summary.get("resources_decrypted", 0)),
+            "resources_copied": int(decrypt_summary.get("resources_copied", 0)),
+            "decrypted_files": int(decrypt_summary.get("decrypted_files", 0)),
+            "copied_files": int(decrypt_summary.get("copied_files", 0)),
+            "failed_files": failed_files,
+            "warnings": warnings,
+            "errors": errors,
+            "output_files": count_files(output_dir),
+        }
+
     try:
+        os.chdir(work_dir)
+        output_space = output_guard.check(force=True)
+        temp_space = work_guard.check(force=True)
+        report["storage"]["output_initial_free_gb"] = output_space["free_gb"]
+        report["storage"]["temp_initial_free_gb"] = temp_space["free_gb"]
+
         print("=== FiveM 服务器 Dump 与 FXAP 解密工具 ===")
         print("功能范围: 包含服务器 Dump、FXAP 解密；不包含模型修复。")
+        print(f"[存储] 输出目录: {output_dir}")
+        print(f"[存储] 临时工作区: {work_dir}")
+        print(
+            f"[存储] 输出盘剩余 {output_space['free_gb']} GB，临时盘剩余 {temp_space['free_gb']} GB，"
+            f"安全保留 {minimum_free_gb} GB。"
+        )
+        print("[存储] 默认逐资源下载、解密并清理临时文件，不再把整个服务器临时数据堆在工具安装盘。")
         print()
 
         emit_progress(2, "java", "正在检测 Java 环境。")
@@ -1311,87 +1552,71 @@ def run_tool(args):
         report["base_url"] = "https://" + server_address
         print(f"[地址] 服务器地址: {server_address}")
 
-        try:
-            emit_progress(24, "dump", "开始服务器 Dump。")
-            dumper = FiveMDumper(report["base_url"], token, max_workers=15)
-            dump_resources = dumper.run(resources_choice)
-            report["dump_summary"] = dumper.summary
-            report["dump_resources"] = dump_resources
-            print("[Dump] 服务器 Dump 阶段完成。")
-        except Exception as exc:
-            exit_code = 10
-            message = f"服务器 Dump 阶段失败: {exc}"
-            report["errors"].append(message)
-            print_error(message)
-            print_warning("将继续尝试 FXAP 解密已有临时文件。")
+        emit_progress(24, "dump", "开始服务器 Dump，并逐资源进行 FXAP 解密。")
+        decryptor = FiveMDecryptor(
+            output_dir=str(output_dir),
+            java_executable=java_info["path"],
+            work_guard=work_guard,
+            output_guard=output_guard,
+        )
+        dumper = FiveMDumper(
+            report["base_url"],
+            token,
+            max_workers=15,
+            work_guard=work_guard,
+            keep_temp=args.keep_temp,
+        )
 
-        try:
-            emit_progress(62, "fxap", "开始 FXAP 解密。")
-            decryptor = FiveMDecryptor(output_dir=str(output_dir), java_executable=java_info["path"])
-            decrypt_resources = decryptor.start()
-            report["decrypt_summary"] = decryptor.summary
-            report["decrypt_resources"] = decrypt_resources
-            print("[FXAP] FXAP 解密阶段完成。")
-        except Exception as exc:
-            exit_code = 10
-            message = f"FXAP 解密阶段失败: {exc}"
-            report["errors"].append(message)
-            print_error(message)
+        def decrypt_ready_resource(resource_path, resource_name):
+            print(f"[流水线] Dump 完成，立即处理 FXAP 并释放临时文件: {resource_name}")
+            decryptor.decrypt_resource(resource_path, resource_name)
 
-        cleanup_temp(args.keep_temp)
+        dumper.run(resources_choice, on_resource_ready=decrypt_ready_resource)
+        print("[Dump] 服务器 Dump 阶段完成。")
+        emit_progress(88, "fxap", "逐资源 FXAP 解密阶段完成。")
+        print("[FXAP] FXAP 解密流程结束。")
 
-        dump_summary = report.get("dump_summary") or {}
-        decrypt_summary = report.get("decrypt_summary") or {}
-        failed_files = int(dump_summary.get("failed_files", 0)) + int(decrypt_summary.get("failed_files", 0))
-        warnings = int(dump_summary.get("warnings", 0)) + int(decrypt_summary.get("warnings", 0)) + len(report["warnings"])
-        errors = int(dump_summary.get("errors", 0)) + int(decrypt_summary.get("errors", 0)) + len(report["errors"])
-        report["summary"] = {
-            "server_resources_total": int(dump_summary.get("resources_total", 0)),
-            "server_resources_selected": int(dump_summary.get("resources_selected", 0)),
-            "downloaded_files": int(dump_summary.get("downloaded_files", 0)),
-            "rpf_unpacked": int(dump_summary.get("rpf_unpacked", 0)),
-            "resources_decrypted": int(decrypt_summary.get("resources_decrypted", 0)),
-            "resources_copied": int(decrypt_summary.get("resources_copied", 0)),
-            "decrypted_files": int(decrypt_summary.get("decrypted_files", 0)),
-            "copied_files": int(decrypt_summary.get("copied_files", 0)),
-            "failed_files": failed_files,
-            "warnings": warnings,
-            "errors": errors,
-            "output_files": count_files(output_dir),
-        }
-
-        if errors:
-            report["status"] = "error"
-            if exit_code == 0:
-                exit_code = 10
-        elif failed_files or warnings:
-            report["status"] = "partial"
-            if exit_code == 0:
-                exit_code = 10
-        else:
-            report["status"] = "success"
-
+    except DiskSpaceError as exc:
+        exit_code = 12
+        report["status"] = "error"
+        message = f"磁盘空间不足，任务已停止，未继续刷重复失败: {exc}"
+        report["errors"].append(message)
+        print_error(message)
     except Exception as exc:
         exit_code = 2
-        message = str(exc)
         report["status"] = "error"
+        message = str(exc)
         report["errors"].append(message)
-        report["summary"] = {
-            "server_resources_total": 0,
-            "server_resources_selected": 0,
-            "downloaded_files": 0,
-            "rpf_unpacked": 0,
-            "resources_decrypted": 0,
-            "resources_copied": 0,
-            "decrypted_files": 0,
-            "copied_files": 0,
-            "failed_files": 0,
-            "warnings": 0,
-            "errors": len(report["errors"]),
-            "output_files": count_files(output_dir),
-        }
         print_error(message)
     finally:
+        update_report_summaries()
+        summary = report.get("summary") or {}
+        if report["status"] == "running":
+            if int(summary.get("errors", 0)) > 0:
+                report["status"] = "error"
+                if exit_code == 0:
+                    exit_code = 10
+            elif int(summary.get("failed_files", 0)) > 0 or int(summary.get("warnings", 0)) > 0:
+                report["status"] = "partial"
+                if exit_code == 0:
+                    exit_code = 10
+            else:
+                report["status"] = "success"
+
+        try:
+            cleanup_temp(work_dir, args.keep_temp)
+        except Exception as exc:
+            message = f"临时工作区清理失败: {exc}"
+            print_warning(message)
+            report["warnings"].append(message)
+            if exit_code == 0:
+                exit_code = 10
+
+        try:
+            report["storage"]["output_final_free_gb"] = format_gb(shutil.disk_usage(str(output_dir)).free)
+        except Exception:
+            report["storage"]["output_final_free_gb"] = ""
+
         report["finished_at"] = now_iso()
         report["elapsed_seconds"] = round(time.time() - start_time, 2)
         emit_progress(94, "report", "正在生成本次报告。")
@@ -1409,7 +1634,6 @@ def run_tool(args):
         print(json.dumps(report, ensure_ascii=False), flush=True)
 
     return exit_code
-
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
