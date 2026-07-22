@@ -27,10 +27,13 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.2"
+TOOL_VERSION = "1.1.3"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
+GRANTS_CLK_DERIVE_URL = "https://grantsclk.ckcloud.de5.net/v1/derive"
+STREAM_EXTENSIONS = {".yft", ".ytd", ".ydr", ".ydd", ".ybn", ".ymap", ".ytyp", ".ymf", ".awc"}
+RSC_HEADERS = (b"RSC7", b"RSC8")
 JAVA_MINIMUM_MAJOR = 8
 JAVA_RECOMMENDED_MAJOR = 17
 
@@ -112,6 +115,23 @@ def mask_token(token):
     return token[:8] + "..." + token[-4:]
 
 
+
+def get_file_hash(file_data):
+    if not file_data:
+        return ""
+    if isinstance(file_data, str):
+        return file_data
+    if isinstance(file_data, dict):
+        return file_data.get("hash", "")
+    return ""
+
+
+def encode_file_path(file_name):
+    return "/".join(
+        quote(segment, safe="")
+        for segment in str(file_name).replace("\\", "/").split("/")
+        if segment
+    )
 def print_warning(message):
     print(f"[警告] {message}", flush=True)
 
@@ -627,18 +647,27 @@ class FiveMDumper:
         stream_files = res.get("streamFiles") or {}
         item["files_total"] = len(files) + len(stream_files)
 
-        for fname, hsh in files.items():
-            url = f"{res.get('fileServer') or self.base_url + '/files'}/{res['name']}/{quote(fname)}?hash={hsh}"
+        for fname, file_data in files.items():
+            hsh = get_file_hash(file_data)
+            if not hsh:
+                self.warn(item, f"Missing hash, skipped: {fname}")
+                continue
+            base_url = (res.get("fileServer") or self.base_url + "/files").rstrip("/")
+            url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
             rpf_key = hmac.new(hmac_key, fname.encode(), hashlib.sha256).digest()
             out_path = os.path.join(temp_dir if fname.endswith(".rpf") else unpacked_dir, fname)
             file_jobs.append((fname, url, rpf_key, iv, out_path))
 
         for fname, body in stream_files.items():
-            url = f"{res.get('fileServer') or self.base_url + '/files'}/{res['name']}/{quote(fname)}?hash={body['hash']}"
+            hsh = get_file_hash(body)
+            if not hsh:
+                self.warn(item, f"Missing stream hash, skipped: {fname}")
+                continue
+            base_url = (res.get("fileServer") or self.base_url + "/files").rstrip("/")
+            url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
             s_key = hmac.new(hmac_key, fname.encode(), hashlib.sha256).digest()
             out_path = os.path.join(unpacked_dir, "stream", fname)
             file_jobs.append((fname, url, s_key, iv, out_path))
-
         print(f"[Dump] ({index}/{total}) 正在下载资源: {resource_name}，文件 {len(file_jobs)} 个。")
         rpf_files = []
         completed = 0
@@ -791,6 +820,7 @@ class FiveMDecryptor:
             "errors": 0,
         }
         self.resource_reports = []
+        self._cloud_key_cache = {}
 
     def warn(self, item, message):
         self.summary["warnings"] += 1
@@ -824,15 +854,34 @@ class FiveMDecryptor:
         return self._chacha_decrypt(enc, key, iv)
 
     def decrypt_buffer(self, hexdata: bytes, key: bytes, bufferPtr=None, ivPtr=None):
-        if not hexdata:
+        if not hexdata or not key:
             return None
         if bufferPtr is not None and ivPtr is not None:
             iv = hexdata[ivPtr : ivPtr + 12]
             enc = hexdata[bufferPtr:]
+            return self._try_chacha_decrypt(enc, key, iv)
+
+        if len(hexdata) >= 18:
+            try:
+                name_length = int.from_bytes(hexdata[4:6], "little")
+                iv_start = 6 + name_length
+                payload_start = iv_start + 12
+                if payload_start <= len(hexdata):
+                    derived = self._try_chacha_decrypt(hexdata[payload_start:], key, hexdata[iv_start:payload_start])
+                    if derived is not None:
+                        return derived
+            except Exception:
+                pass
+
+        return self._try_chacha_decrypt(hexdata[92:], key, hexdata[80:92])
+
+    def _try_chacha_decrypt(self, enc: bytes, key: bytes, iv: bytes):
+        if not key or len(key) != 32 or not enc or len(iv) not in (8, 12):
+            return None
+        try:
             return self._chacha_decrypt(enc, key, iv)
-        iv = hexdata[80:92]
-        enc = hexdata[92:]
-        return self._chacha_decrypt(enc, key, iv)
+        except Exception:
+            return None
 
     def _chacha_decrypt(self, enc: bytes, key: bytes, iv: bytes):
         try:
@@ -843,9 +892,63 @@ class FiveMDecryptor:
                 cipher = ChaCha20.new(key=key, nonce=iv[:8])
                 return cipher.decrypt(enc)
             except Exception as exc:
-                raise RuntimeError(f"ChaCha20 解密失败: {exc}") from exc
+                raise RuntimeError(f"ChaCha20 decrypt failed: {exc}") from exc
+
+    def is_rsc_header(self, buf: bytes):
+        return bool(buf and len(buf) >= 4 and buf[:4] in RSC_HEADERS)
+
+    def is_stream_file(self, file_name: str):
+        return Path(file_name).suffix.lower() in STREAM_EXTENSIONS
+
+    def validate_decryption(self, buf: bytes):
+        return bool(buf and (buf.startswith(b"\x1bLua") or self.is_rsc_header(buf)))
+
+    def find_filename_end(self, buf: bytes):
+        lower_exts = [ext.encode("ascii") for ext in STREAM_EXTENSIONS]
+        lower_buf = buf.lower()
+        limit = max(0, len(buf) - 20)
+        for index in range(limit):
+            window = lower_buf[index : index + 32]
+            for ext in lower_exts:
+                pos = window.find(ext)
+                if pos != -1:
+                    return index + pos + len(ext)
+        return -1
+
+    def decrypt_stream_buffer(self, encrypted_data: bytes, key: bytes):
+        if not encrypted_data or len(encrypted_data) < 100 or not key:
+            return None
+
+        filename_end = self.find_filename_end(encrypted_data)
+        if filename_end > 0:
+            for offset in (0, 1, 2, 4, 8):
+                iv_start = filename_end + offset
+                if iv_start + 12 >= len(encrypted_data):
+                    continue
+                result = self._try_chacha_decrypt(encrypted_data[iv_start + 12 :], key, encrypted_data[iv_start : iv_start + 12])
+                if self.is_rsc_header(result):
+                    return result
+
+        for iv_start in range(40, 121):
+            if iv_start + 12 >= len(encrypted_data):
+                continue
+            result = self._try_chacha_decrypt(encrypted_data[iv_start + 12 :], key, encrypted_data[iv_start : iv_start + 12])
+            if self.is_rsc_header(result):
+                return result
+        return None
+
+    def add_key_candidate(self, candidates, seen, key):
+        if not key or not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+            return
+        key = bytes(key)
+        marker = key.hex()
+        if marker not in seen:
+            seen.add(marker)
+            candidates.append(key)
 
     def calculate_client_key(self, grants_clk: bytes):
+        if not grants_clk or len(grants_clk) < 16:
+            return None
         iv = grants_clk[:16]
         enc = grants_clk[16:]
         cipher = AES.new(self.AesKey, AES.MODE_CBC, iv)
@@ -855,6 +958,151 @@ class FiveMDecryptor:
         except ValueError:
             return decrypted
 
+    def derive_cloud_client_key(self, grants_clk: bytes, resource_id, item=None):
+        if not grants_clk or len(grants_clk) != 0x30 or resource_id is None:
+            return None
+        cache_key = (str(resource_id), grants_clk.hex())
+        if cache_key in self._cloud_key_cache:
+            return self._cloud_key_cache[cache_key]
+
+        try:
+            resp = requests.post(
+                GRANTS_CLK_DERIVE_URL,
+                json={"resourceId": str(resource_id), "grants_clk": grants_clk.hex()},
+                headers={"Content-Type": "application/json", "User-Agent": "CK-DumpTool/1"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                self.warn(item, f"Cloud grants_clk derive failed for resource {resource_id}: HTTP {resp.status_code}")
+                self._cloud_key_cache[cache_key] = None
+                return None
+            key_hex = (resp.json() or {}).get("key", "")
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", str(key_hex)):
+                self.warn(item, f"Cloud grants_clk derive returned invalid key for resource {resource_id}")
+                self._cloud_key_cache[cache_key] = None
+                return None
+            key = bytes.fromhex(key_hex)
+            self._cloud_key_cache[cache_key] = key
+            return key
+        except Exception as exc:
+            self.warn(item, f"Cloud grants_clk derive unavailable for resource {resource_id}: {exc}")
+            self._cloud_key_cache[cache_key] = None
+            return None
+
+    def calculate_client_key_candidates(self, grants_clk: bytes, resource_id=None, item=None):
+        candidates = []
+        seen = set()
+        self.add_key_candidate(candidates, seen, self.derive_cloud_client_key(grants_clk, resource_id, item))
+        try:
+            self.add_key_candidate(candidates, seen, self.calculate_client_key(grants_clk))
+        except Exception as exc:
+            self.warn(item, f"AES grants_clk fallback failed for resource {resource_id}: {exc}")
+        if grants_clk and len(grants_clk) >= 48:
+            self.add_key_candidate(candidates, seen, grants_clk[16:48])
+        return candidates
+
+    def find_encrypted_sample_file(self, files, resource_path):
+        for relative in files:
+            if os.path.basename(relative).lower() == ".fxap":
+                continue
+            full_path = os.path.join(resource_path, relative)
+            try:
+                if self.verify_encrypted(full_path):
+                    return full_path
+            except Exception:
+                continue
+        return None
+
+    def find_working_key_pair(self, fxap_layer, decrypt_key, alternative_keys):
+        if decrypt_key:
+            result = self.decrypt_buffer(fxap_layer, decrypt_key)
+            if self.validate_decryption(result):
+                return {"matched": True, "alternative_key": None}
+        for alternative_key in alternative_keys:
+            result = self.decrypt_buffer(fxap_layer, alternative_key)
+            if self.validate_decryption(result):
+                return {"matched": True, "alternative_key": alternative_key}
+        return {"matched": False, "alternative_key": None}
+
+    def resolve_working_keys(self, resource_path, files, grants_data, resource_id, decrypt_key, grants_clk, item=None):
+        sample_path = self.find_encrypted_sample_file(files, resource_path)
+        initial_candidates = self.calculate_client_key_candidates(grants_clk, resource_id, item)
+        if not sample_path:
+            return {
+                "resource_id": str(resource_id),
+                "decrypt_key": decrypt_key,
+                "grants_clk": grants_clk,
+                "alternative_key": initial_candidates[0] if initial_candidates else None,
+            }
+
+        fxap_layer = self.decrypt_file(sample_path, self.DefaultKey)
+        if not fxap_layer:
+            return {
+                "resource_id": str(resource_id),
+                "decrypt_key": decrypt_key,
+                "grants_clk": grants_clk,
+                "alternative_key": initial_candidates[0] if initial_candidates else None,
+            }
+
+        initial_match = self.find_working_key_pair(fxap_layer, decrypt_key, initial_candidates)
+        if initial_match["matched"]:
+            return {
+                "resource_id": str(resource_id),
+                "decrypt_key": decrypt_key,
+                "grants_clk": grants_clk,
+                "alternative_key": initial_match["alternative_key"] or (initial_candidates[0] if initial_candidates else None),
+            }
+
+        for candidate_id, key_hex in (grants_data.get("grants") or {}).items():
+            try:
+                candidate_key = bytes.fromhex(key_hex)
+            except Exception:
+                continue
+            candidate_clk = grants_clk
+            candidate_candidates = []
+            if (grants_data.get("grants_clk") or {}).get(candidate_id):
+                try:
+                    candidate_clk = bytes.fromhex(grants_data["grants_clk"][candidate_id])
+                    candidate_candidates = self.calculate_client_key_candidates(candidate_clk, candidate_id, item)
+                except Exception:
+                    candidate_candidates = []
+            candidate_match = self.find_working_key_pair(fxap_layer, candidate_key, candidate_candidates)
+            if candidate_match["matched"]:
+                if str(candidate_id) != str(resource_id):
+                    self.warn(item, f"Resource ID switched from {resource_id} to {candidate_id} after key validation")
+                return {
+                    "resource_id": str(candidate_id),
+                    "decrypt_key": candidate_key,
+                    "grants_clk": candidate_clk,
+                    "alternative_key": candidate_match["alternative_key"] or (candidate_candidates[0] if candidate_candidates else None),
+                }
+
+        return {
+            "resource_id": str(resource_id),
+            "decrypt_key": decrypt_key,
+            "grants_clk": grants_clk,
+            "alternative_key": initial_candidates[0] if initial_candidates else None,
+        }
+
+    def write_binary_output(self, output_path, data: bytes):
+        if self.OutputGuard:
+            self.OutputGuard.check(required_bytes=len(data))
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "wb") as out:
+            out.write(data)
+
+    def process_stream_file(self, decrypted_file, output_path, decrypt_key, alternative_key):
+        result = self.decrypt_buffer(decrypted_file, decrypt_key)
+        if not self.is_rsc_header(result):
+            result = self.decrypt_stream_buffer(decrypted_file, decrypt_key)
+        if not result and alternative_key:
+            result = self.decrypt_buffer(decrypted_file, alternative_key)
+        if result and not self.is_rsc_header(result) and alternative_key:
+            result = self.decrypt_stream_buffer(decrypted_file, alternative_key)
+        if not self.is_rsc_header(result):
+            return False
+        self.write_binary_output(output_path, result)
+        return True
     def process_lua_file(self, decrypted_buffer: bytes, output_path: str, resource_name: str, file_rel: str):
         tmp_path = os.path.join(self.TempDir, f"{resource_name}/{file_rel}c")
         if self.WorkGuard:
@@ -925,13 +1173,13 @@ class FiveMDecryptor:
                 results.append(os.path.join(root, f))
         return results
 
-    def decrypt_resource_file(self, resource_path, relative_file, decrypt_key, resource_name, grants_clk, item):
+    def decrypt_resource_file(self, resource_path, relative_file, resource_id, decrypt_key, resource_name, grants_clk, alternative_key, item):
         try:
             full_path = os.path.join(resource_path, relative_file)
             output_path = os.path.join(self.OutputDir, resource_name, relative_file)
 
             if not os.path.exists(full_path):
-                return {"status": "missing", "file": relative_file, "error": "文件不存在"}
+                return {"status": "missing", "file": relative_file, "error": "file does not exist"}
 
             if not self.verify_encrypted(full_path):
                 if self.OutputGuard:
@@ -943,19 +1191,15 @@ class FiveMDecryptor:
 
             decrypted_file = self.decrypt_file(full_path, self.DefaultKey)
             if not decrypted_file:
-                return {"status": "failed", "file": relative_file, "error": "初始 FXAP 解密失败"}
-
-            decrypted_buffer = self.decrypt_buffer(decrypted_file, decrypt_key)
-            if decrypted_buffer is None:
-                return {"status": "failed", "file": relative_file, "error": "资源数据解密失败"}
+                return {"status": "failed", "file": relative_file, "error": "initial FXAP decrypt failed"}
         except DiskSpaceError:
             raise
         except OSError as exc:
             if is_disk_full_error(exc) and self.OutputGuard:
                 self.OutputGuard.raise_write_error(exc)
-            return {"status": "failed", "file": relative_file, "error": f"处理异常: {exc}"}
+            return {"status": "failed", "file": relative_file, "error": f"processing error: {exc}"}
         except Exception as exc:
-            return {"status": "failed", "file": relative_file, "error": f"处理异常: {exc}"}
+            return {"status": "failed", "file": relative_file, "error": f"processing error: {exc}"}
 
         try:
             if relative_file.lower().endswith(".lua"):
@@ -973,24 +1217,34 @@ class FiveMDecryptor:
                         except OSError:
                             pass
 
-                candidates = [("标准偏移/授权密钥", decrypted_buffer)]
-                candidate_errors = []
-                try:
-                    candidates.append((
-                        "备用偏移/授权密钥",
-                        self.decrypt_buffer(decrypted_file, decrypt_key, bufferPtr=90, ivPtr=78),
-                    ))
-                except Exception as exc:
-                    candidate_errors.append(f"备用偏移解密异常: {exc}")
+                key_candidates = [("grant key", decrypt_key)]
+                if alternative_key:
+                    key_candidates.append(("cloud grants_clk key", alternative_key))
 
-                try:
-                    alternative_key = self.calculate_client_key(grants_clk)
-                    candidates.append((
-                        "标准偏移/客户端密钥",
-                        self.decrypt_buffer(decrypted_file, alternative_key),
-                    ))
-                except Exception as exc:
-                    candidate_errors.append(f"客户端密钥解密异常: {exc}")
+                candidates = []
+                candidate_errors = []
+                for key_label, key in key_candidates:
+                    try:
+                        candidates.append((f"standard offset/{key_label}", self.decrypt_buffer(decrypted_file, key)))
+                    except Exception as exc:
+                        candidate_errors.append(f"standard offset/{key_label}: {exc}")
+                    try:
+                        candidates.append((f"legacy offset/{key_label}", self.decrypt_buffer(decrypted_file, key, bufferPtr=90, ivPtr=78)))
+                    except Exception as exc:
+                        candidate_errors.append(f"legacy offset/{key_label}: {exc}")
+
+                for key_label, key in key_candidates:
+                    for buffer_ptr in range(50, 151):
+                        for iv_ptr in range(38, 139):
+                            if iv_ptr + 12 > buffer_ptr:
+                                continue
+                            candidate = self.decrypt_buffer(decrypted_file, key, bufferPtr=buffer_ptr, ivPtr=iv_ptr)
+                            if candidate and candidate.startswith(self.LuaHeader):
+                                candidates.append((f"scan {buffer_ptr}/{iv_ptr}/{key_label}", candidate))
+                                break
+                        else:
+                            continue
+                        break
 
                 decompile_failures = []
                 last_result = None
@@ -1015,30 +1269,35 @@ class FiveMDecryptor:
                         "file": relative_file,
                         "output": (last_result or {}).get("output", ""),
                         "lua": (last_result or {}).get("status", "decompile_error"),
-                        "error": "Lua 5.4 字节码已解密，但 unluac54.jar 反编译失败: " + " | ".join(decompile_failures),
+                        "error": "Lua bytecode decrypted, but unluac54.jar failed: " + " | ".join(decompile_failures),
                     }
 
-                detail = "；".join(candidate_errors)
-                error = "所有解密候选均未通过 Lua 5.4 文件头校验，未生成 .lua 文件。"
+                detail = "; ".join(candidate_errors)
+                error = "all Lua decrypt candidates failed header validation"
                 if detail:
-                    error += " " + detail
+                    error += ": " + detail
                 return {"status": "failed", "file": relative_file, "error": error}
 
-            if self.OutputGuard:
-                self.OutputGuard.check(required_bytes=len(decrypted_buffer))
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            with open(output_path, "wb") as out:
-                out.write(decrypted_buffer)
+            if self.is_stream_file(relative_file):
+                if self.process_stream_file(decrypted_file, output_path, decrypt_key, alternative_key):
+                    return {"status": "decrypted", "file": relative_file, "output": output_path, "stream": "rsc"}
+                return {"status": "failed", "file": relative_file, "error": "stream RSC decrypt failed"}
+
+            decrypted_buffer = self.decrypt_buffer(decrypted_file, decrypt_key)
+            if not decrypted_buffer and alternative_key:
+                decrypted_buffer = self.decrypt_buffer(decrypted_file, alternative_key)
+            if not decrypted_buffer:
+                return {"status": "failed", "file": relative_file, "error": "resource data decrypt failed"}
+            self.write_binary_output(output_path, decrypted_buffer)
             return {"status": "decrypted", "file": relative_file, "output": output_path}
         except DiskSpaceError:
             raise
         except OSError as exc:
             if is_disk_full_error(exc) and self.OutputGuard:
                 self.OutputGuard.raise_write_error(exc)
-            return {"status": "failed", "file": relative_file, "error": f"写入失败: {exc}"}
+            return {"status": "failed", "file": relative_file, "error": f"write failed: {exc}"}
         except Exception as exc:
-            return {"status": "failed", "file": relative_file, "error": f"写入失败: {exc}"}
-
+            return {"status": "failed", "file": relative_file, "error": f"write failed: {exc}"}
     def validate_key_from_file(self, grants_path):
         with open(grants_path, "r", encoding="utf-8") as f:
             grants_token = f.read().strip()
@@ -1140,19 +1399,54 @@ class FiveMDecryptor:
                 self.resource_reports.append(item)
                 return item
 
-            decrypt_key = bytes.fromhex(payload["grants"][str(resource_id)])
-            grants_clk_hex = payload["grants_clk"][str(resource_id)]
+            grants_data = {
+                "grants": payload.get("grants", {}),
+                "grants_clk": payload.get("grants_clk", {}),
+            }
+            decrypt_key = bytes.fromhex(grants_data["grants"][str(resource_id)])
+            grants_clk_hex = grants_data["grants_clk"].get(str(resource_id), "")
+            if not grants_clk_hex:
+                self.error(item, f"missing grants_clk for resource {resource_name} (ID {resource_id})")
+                item["status"] = "failed"
+                self.resource_reports.append(item)
+                return item
             grants_clk = bytes.fromhex(grants_clk_hex)
 
-            print(f"[FXAP] 正在解密: {resource_name} (ID: {resource_id})")
+            print(f"[FXAP] Resolving keys with cloud grants_clk API: {resource_name} (ID: {resource_id})")
 
             files = [f for f in self.get_all_files(resource_path) if not f.endswith(".fxap")]
+            relative_files = [os.path.relpath(f, resource_path).replace("\\", "/") for f in files]
             item["files_total"] = len(files)
+
+            key_state = self.resolve_working_keys(
+                resource_path,
+                relative_files,
+                grants_data,
+                str(resource_id),
+                decrypt_key,
+                grants_clk,
+                item,
+            )
+            resolved_resource_id = key_state["resource_id"]
+            item["resource_id"] = str(resolved_resource_id)
+            decrypt_key = key_state["decrypt_key"]
+            grants_clk = key_state["grants_clk"]
+            alternative_key = key_state.get("alternative_key")
+
             tasks = []
             with ThreadPoolExecutor(max_workers=6) as exe:
-                for file_full in files:
-                    relative = os.path.relpath(file_full, resource_path).replace("\\", "/")
-                    tasks.append(exe.submit(self.decrypt_resource_file, resource_path, relative, decrypt_key, resource_name, grants_clk, item))
+                for relative in relative_files:
+                    tasks.append(exe.submit(
+                        self.decrypt_resource_file,
+                        resource_path,
+                        relative,
+                        resolved_resource_id,
+                        decrypt_key,
+                        resource_name,
+                        grants_clk,
+                        alternative_key,
+                        item,
+                    ))
 
                 for task in as_completed(tasks):
                     try:
@@ -1173,8 +1467,7 @@ class FiveMDecryptor:
                     else:
                         item["failed_files"] += 1
                         self.summary["failed_files"] += 1
-                        self.warn(item, f"{result.get('file') or resource_name} 解密失败: {result.get('error') or '未知错误'}")
-
+                        self.warn(item, f"{result.get('file') or resource_name} decrypt failed: {result.get('error') or 'unknown error'}")
             if item["failed_files"] == 0:
                 item["status"] = "decrypted"
                 self.summary["resources_decrypted"] += 1
