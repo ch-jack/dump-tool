@@ -28,7 +28,7 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.5"
+TOOL_VERSION = "1.1.6"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -117,6 +117,41 @@ def mask_token(token):
     if len(token) <= 12:
         return token[:3] + "***"
     return token[:8] + "..." + token[-4:]
+
+
+def normalize_token(value):
+    text = str(value or "")
+    prefix = "X-CitizenFX-Token:"
+    if text.lower().startswith(prefix.lower()):
+        text = text[len(prefix) :]
+
+    text = re.split(r"[\x00\r\n]", text, maxsplit=1)[0].strip()
+    if not text:
+        raise RuntimeError("扫描到的 FiveM token 为空，请重新进入服务器后再试。")
+    if len(text) > 512 or not re.fullmatch(r"[!-~]+", text):
+        raise RuntimeError("FiveM token 包含空格、控制字符或其他非法字符，请重新进入服务器后再试。")
+    return text
+
+
+def extract_token_from_memory(data, marker=b"X-CitizenFX-Token: "):
+    search_from = 0
+    while True:
+        marker_index = data.find(marker, search_from)
+        if marker_index == -1:
+            return None
+
+        value_start = marker_index + len(marker)
+        value_end = min(len(data), value_start + 512)
+        for delimiter in (b"\x00", b"\r", b"\n"):
+            delimiter_index = data.find(delimiter, value_start, value_end)
+            if delimiter_index != -1:
+                value_end = min(value_end, delimiter_index)
+
+        candidate = data[value_start:value_end].decode("ascii", errors="ignore")
+        try:
+            return normalize_token(candidate)
+        except RuntimeError:
+            search_from = value_start
 
 
 def get_file_hash(file_data):
@@ -464,7 +499,6 @@ def get_token():
     if not handle:
         raise RuntimeError("无法打开 FiveM 进程，请尝试以管理员身份运行。")
 
-    token_marker = b"X-CitizenFX-Token: "
     address = 0
     mbi = MEMORY_BASIC_INFORMATION()
 
@@ -484,13 +518,9 @@ def get_token():
 
                 if ReadProcessMemory(handle, mbi.BaseAddress, buffer, mbi.RegionSize, ctypes.byref(bytes_read)):
                     data = bytes(buffer)[: bytes_read.value]
-                    idx = data.find(token_marker)
-                    if idx != -1:
-                        end = data.find(b"\x00", idx)
-                        if end == -1:
-                            end = idx + 160
-                        token = data[idx:end].decode("ascii", errors="ignore")
-                        return token.replace("X-CitizenFX-Token:", "").strip()
+                    token = extract_token_from_memory(data)
+                    if token:
+                        return token
 
             if mbi.RegionSize <= 0:
                 break
@@ -544,10 +574,10 @@ def get_ip_from_cfx(target):
 class FiveMDumper:
     def __init__(self, base_url, token, max_workers=10, work_guard=None, keep_temp=False):
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.token = normalize_token(token)
         self.session = requests.Session()
         self.session.verify = False
-        self.session.headers.update({"X-CitizenFX-Token": token, "User-Agent": "CitizenFX/1"})
+        self.session.headers.update({"X-CitizenFX-Token": self.token, "User-Agent": "CitizenFX/1"})
         self.max_workers = max_workers
         self.work_guard = work_guard
         self.keep_temp = bool(keep_temp)
@@ -1947,6 +1977,7 @@ def choose_token(args):
             token = input("请输入自定义 token: ").strip()
         if not token:
             raise RuntimeError("已选择手动 token，但没有提供 token。")
+        token = normalize_token(token)
         print(f"[Token] 使用自定义 token: {mask_token(token)}")
         return token
 
@@ -1962,6 +1993,7 @@ def choose_token(args):
             token = input("请输入 token: ").strip()
     if not token:
         raise RuntimeError("没有可用 token。请确认 FiveM 正在运行且已进入服务器，或使用 --token-choice 2 --token。")
+    token = normalize_token(token)
     print(f"[Token] 已获取 token: {mask_token(token)}")
     return token
 
