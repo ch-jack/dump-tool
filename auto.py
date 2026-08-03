@@ -28,7 +28,7 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.6"
+TOOL_VERSION = "1.1.7"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -534,11 +534,23 @@ def get_token():
     return None
 
 
-def get_ip_from_cfx(target):
+def server_base_urls(value, address):
+    text = (value or "").strip()
+    scheme_match = re.match(r"^(https?)://", text, re.I)
+    if scheme_match:
+        return [f"{scheme_match.group(1).lower()}://{address}"]
+    return [f"https://{address}", f"http://{address}"]
+
+
+def resolve_server_endpoint(target):
     direct = direct_server_address(target)
     if direct:
-        print(f"[地址] 使用直连服务器地址: {direct}")
-        return direct
+        base_urls = server_base_urls(target, direct)
+        if len(base_urls) == 1:
+            print(f"[地址] 使用直连服务器地址: {base_urls[0]}")
+        else:
+            print(f"[地址] 使用直连服务器地址: {direct}（自动尝试 HTTPS/HTTP）")
+        return {"address": direct, "base_urls": base_urls}
 
     link = (target or "").strip()
     if not link:
@@ -554,26 +566,37 @@ def get_ip_from_cfx(target):
             raise RuntimeError("响应中没有 x-citizenfx-url，无法解析服务器真实地址。")
 
         direct = direct_server_address(header)
-        if direct:
-            print(f"[地址] 已从 cfx.re 解析到服务器: {direct}")
-            return direct
 
         cleaned = re.sub(r"^https?://", "", header.strip(), flags=re.I).rstrip("/")
         match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})", cleaned)
         if match:
             direct = direct_server_address(match.group(1))
-            if direct:
-                print(f"[地址] 已从 cfx.re 解析到服务器: {direct}")
-                return direct
+
+        if direct:
+            base_urls = server_base_urls(header, direct)
+            print(f"[地址] 已从 cfx.re 解析到服务器: {base_urls[0]}")
+            return {"address": direct, "base_urls": base_urls}
 
         raise RuntimeError(f"解析到的服务器地址无效: {header}")
     except Exception as exc:
         raise RuntimeError(f"从 {link} 解析服务器地址失败: {exc}") from exc
 
 
+def get_ip_from_cfx(target):
+    return resolve_server_endpoint(target)["address"]
+
+
 class FiveMDumper:
-    def __init__(self, base_url, token, max_workers=10, work_guard=None, keep_temp=False):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url, token, max_workers=10, work_guard=None, keep_temp=False, fallback_base_urls=None):
+        candidates = [base_url] + list(fallback_base_urls or [])
+        self.base_urls = []
+        for candidate in candidates:
+            normalized = str(candidate or "").strip().rstrip("/")
+            if normalized and normalized not in self.base_urls:
+                self.base_urls.append(normalized)
+        if not self.base_urls:
+            raise RuntimeError("服务器连接地址为空。")
+        self.base_url = self.base_urls[0]
         self.token = normalize_token(token)
         self.session = requests.Session()
         self.session.verify = False
@@ -610,11 +633,26 @@ class FiveMDumper:
 
     def get_configuration(self, save_grants=True):
         emit_progress(22, "server_config", "正在向服务器请求资源配置。")
-        url = f"{self.base_url}/client"
         data = {"method": "getConfiguration"}
-        resp = self.session.post(url, data=data, timeout=30)
-        resp.raise_for_status()
-        js = resp.json()
+        js = None
+        for index, base_url in enumerate(self.base_urls):
+            self.base_url = base_url
+            url = f"{self.base_url}/client"
+            try:
+                resp = self.session.post(url, data=data, timeout=30)
+                resp.raise_for_status()
+                js = resp.json()
+                break
+            except requests.exceptions.HTTPError:
+                raise
+            except requests.exceptions.RequestException as exc:
+                if index + 1 >= len(self.base_urls):
+                    raise
+                next_base_url = self.base_urls[index + 1]
+                print_warning(f"{base_url} 连接失败，正在改用 {next_base_url}：{exc}")
+
+        if js is None:
+            raise RuntimeError("服务器没有返回有效配置。")
 
         if save_grants:
             if self.work_guard:
@@ -2007,6 +2045,7 @@ def run_resource_listing(args):
         "status": "error",
         "target": args.target or "",
         "server_address": "",
+        "base_url": "",
         "resources": [],
         "error": "",
     }
@@ -2020,11 +2059,18 @@ def run_resource_listing(args):
 
         token = choose_token(args)
         emit_progress(15, "resolve", "Resolving server address")
-        server_address = get_ip_from_cfx(target)
-        payload["server_address"] = server_address
+        endpoint = resolve_server_endpoint(target)
+        payload["server_address"] = endpoint["address"]
+        payload["base_url"] = endpoint["base_urls"][0]
 
-        dumper = FiveMDumper("https://" + server_address, token, max_workers=1)
+        dumper = FiveMDumper(
+            endpoint["base_urls"][0],
+            token,
+            max_workers=1,
+            fallback_base_urls=endpoint["base_urls"][1:],
+        )
         resources = dumper.get_configuration(save_grants=False)
+        payload["base_url"] = dumper.base_url
         payload["resources"] = [
             {"index": index, "name": str(resource.get("name", ""))}
             for index, resource in enumerate(resources)
@@ -2174,10 +2220,10 @@ def run_tool(args):
         token = choose_token(args)
 
         emit_progress(15, "resolve", "正在解析服务器地址。")
-        server_address = get_ip_from_cfx(target)
-        report["server_address"] = server_address
-        report["base_url"] = "https://" + server_address
-        print(f"[地址] 服务器地址: {server_address}")
+        endpoint = resolve_server_endpoint(target)
+        report["server_address"] = endpoint["address"]
+        report["base_url"] = endpoint["base_urls"][0]
+        print(f"[地址] 服务器地址: {endpoint['address']}")
 
         emit_progress(24, "dump", "开始服务器 Dump，并逐资源进行 FXAP 解密。")
         decryptor = FiveMDecryptor(
@@ -2192,6 +2238,7 @@ def run_tool(args):
             max_workers=15,
             work_guard=work_guard,
             keep_temp=args.keep_temp,
+            fallback_base_urls=endpoint["base_urls"][1:],
         )
 
         def decrypt_ready_resource(resource_path, resource_name):
@@ -2199,6 +2246,7 @@ def run_tool(args):
             decryptor.decrypt_resource(resource_path, resource_name)
 
         dumper.run(resources_choice, on_resource_ready=decrypt_ready_resource)
+        report["base_url"] = dumper.base_url
         print("[Dump] 服务器 Dump 阶段完成。")
         emit_progress(88, "fxap", "逐资源 FXAP 解密阶段完成。")
         print("[FXAP] FXAP 解密流程结束。")
