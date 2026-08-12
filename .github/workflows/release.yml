@@ -27,7 +27,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $releaseTag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "v1.0.$env:GITHUB_RUN_NUMBER" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $releaseTag = $env:GITHUB_REF_NAME
+          } else {
+            $source = Get-Content -LiteralPath '.\auto.py' -Raw -Encoding UTF8
+            if ($source -notmatch '(?m)^TOOL_VERSION\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$') {
+              throw 'Unable to read TOOL_VERSION from auto.py'
+            }
+            $releaseTag = "v$($Matches.version)"
+          }
           $releaseVersion = $releaseTag.TrimStart('v')
           if ($releaseVersion -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid release version: $releaseVersion" }
           "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -49,7 +57,12 @@ jobs:
             'install.bat',
             'Bin\Unpacker.exe',
             'Tools\Decompile\unluac54.jar',
-            'FIXER\FivemDecryptFixer.exe'
+            'FIXER\FivemDecryptFixer.exe',
+            'FIXER\FivemDecryptFixer.dll',
+            'FIXER\FivemDecryptFixer.Cli.exe',
+            'FIXER\FivemDecryptFixer.Cli.dll',
+            'FIXER\FivemDecryptFixer.Cli.deps.json',
+            'FIXER\FivemDecryptFixer.Cli.runtimeconfig.json'
           )
           foreach ($item in $required) {
             if (-not (Test-Path -LiteralPath $item -PathType Leaf)) {

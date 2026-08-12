@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,10 +29,16 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.7"
+TOOL_VERSION = "1.1.8"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
+VERTEX_FIXER_CLI = SCRIPT_DIR / "FIXER" / "FivemDecryptFixer.Cli.exe"
+VERTEX_FIX_EXTENSIONS = {".ydr", ".yft", ".ydd"}
+VERTEX_FIX_DISCLAIMER = (
+    "顶点修复不等于模型修复，不一定能 100% 修复模型，也不保证修复后的模型可以被 FiveM 加载。"
+    "如需修复模型，可以进群找群主免费修复。"
+)
 GRANTS_CLK_DERIVE_URL = "https://grantsclk.ckcloud.de5.net/v1/derive"
 GRANTS_CLK_REQUESTS_PER_MINUTE = 45
 GRANTS_CLK_MIN_INTERVAL_SECONDS = 60.0 / GRANTS_CLK_REQUESTS_PER_MINUTE
@@ -94,6 +101,16 @@ def emit_progress(percent, stage, message):
     print("CK_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def print_external_line(prefix, value):
+    message = f"{prefix}{value}"
+    try:
+        print(message, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(safe_message, flush=True)
+
+
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -109,6 +126,159 @@ def count_files(path):
     for _, _, files in os.walk(path):
         total += len(files)
     return total
+
+
+def directory_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def create_vertex_fix_output_dir(output_dir):
+    output_dir = Path(output_dir).resolve()
+    base = output_dir.parent / f"{output_dir.name}_顶点修复"
+    if not base.exists():
+        return base
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for suffix in range(1000):
+        candidate_name = f"{base.name}_{timestamp}"
+        if suffix:
+            candidate_name += f"-{suffix}"
+        candidate = base.parent / candidate_name
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("无法创建唯一的顶点修复输出目录。")
+
+
+def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
+    result = {
+        "enabled": True,
+        "status": "pending",
+        "source_output": str(Path(output_dir).resolve()),
+        "output": "",
+        "resources_eligible": 0,
+        "resources_copied": 0,
+        "scanned_files": 0,
+        "repaired_files": 0,
+        "failed_files": 0,
+        "exit_code": None,
+        "warnings": [],
+        "disclaimer": VERTEX_FIX_DISCLAIMER,
+    }
+
+    eligible = []
+    for item in decrypt_resources or []:
+        if not item.get("is_fxap") or item.get("status") != "decrypted":
+            continue
+        source = Path(item.get("output_dir") or "")
+        if source.is_dir():
+            eligible.append((item, source.resolve()))
+
+    result["resources_eligible"] = len(eligible)
+    if not eligible:
+        result["status"] = "skipped"
+        print("[顶点修复] 本次没有已解密的 FXAP 资源，已跳过顶点修复。")
+        return result
+
+    if not VERTEX_FIXER_CLI.is_file():
+        raise RuntimeError(f"缺少顶点修复命令行工具: {VERTEX_FIXER_CLI}")
+
+    fixed_root = create_vertex_fix_output_dir(output_dir)
+    model_bytes = 0
+    for _, source in eligible:
+        for path in source.rglob("*"):
+            if path.is_file() and path.suffix.lower() in VERTEX_FIX_EXTENSIONS:
+                try:
+                    model_bytes += path.stat().st_size
+                except OSError:
+                    pass
+    required_bytes = sum(directory_size(source) for _, source in eligible) + model_bytes
+    if output_guard:
+        output_guard.check(required_bytes=required_bytes, force=True)
+
+    fixed_root.mkdir(parents=True, exist_ok=False)
+    result["output"] = str(fixed_root)
+    print(f"[顶点修复] 原解密目录保持不变: {Path(output_dir).resolve()}")
+    print(f"[顶点修复] 正在复制 {len(eligible)} 个 FXAP 资源的完整目录到: {fixed_root}")
+
+    for index, (item, source) in enumerate(eligible, start=1):
+        destination = fixed_root / source.name
+        if destination.exists():
+            raise RuntimeError(f"顶点修复副本目录冲突: {destination}")
+        shutil.copytree(source, destination)
+        result["resources_copied"] += 1
+        print(f"[顶点修复] 已复制完整资源 {index}/{len(eligible)}: {item.get('name', source.name)}")
+
+    work_root = Path(tempfile.mkdtemp(prefix=".ck_vertex_fix_work-", dir=str(fixed_root.parent)))
+    model_file_count = 0
+    try:
+        for _, source in eligible:
+            destination = fixed_root / source.name
+            for model_path in destination.rglob("*"):
+                if not model_path.is_file() or model_path.suffix.lower() not in VERTEX_FIX_EXTENSIONS:
+                    continue
+                relative = model_path.relative_to(fixed_root)
+                work_path = work_root / relative
+                work_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(model_path, work_path)
+                model_file_count += 1
+
+        print(f"[顶点修复] 已隔离 {model_file_count} 个 .ydr/.yft/.ydd 文件；其他文件不会交给修复器。")
+        print(f"[顶点修复提示] {VERTEX_FIX_DISCLAIMER}")
+        proc = subprocess.run(
+            [str(VERTEX_FIXER_CLI), "fix-models", str(work_root)],
+            cwd=str(VERTEX_FIXER_CLI.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+        for repaired_path in work_root.rglob("*"):
+            if repaired_path.is_file() and repaired_path.suffix.lower() in VERTEX_FIX_EXTENSIONS:
+                destination = fixed_root / repaired_path.relative_to(work_root)
+                shutil.copy2(repaired_path, destination)
+    finally:
+        if work_root.exists():
+            shutil.rmtree(work_root, ignore_errors=True)
+    result["exit_code"] = int(proc.returncode)
+    combined_lines = []
+    for text in (proc.stdout, proc.stderr):
+        for line in (text or "").splitlines():
+            if line.strip():
+                combined_lines.append(line.rstrip())
+                print_external_line("[顶点修复] ", line.rstrip())
+
+    summary_pattern = re.compile(r"\[MODEL\]\s+scanned=(\d+),\s*repaired=(\d+),\s*failed=(\d+)")
+    for line in reversed(combined_lines):
+        match = summary_pattern.search(line)
+        if match:
+            result["scanned_files"] = int(match.group(1))
+            result["repaired_files"] = int(match.group(2))
+            result["failed_files"] = int(match.group(3))
+            break
+
+    if proc.returncode == 0:
+        result["status"] = "success"
+    elif result["repaired_files"] > 0 or result["resources_copied"] > 0:
+        result["status"] = "partial"
+        result["warnings"].append(
+            f"顶点修复部分失败：扫描 {result['scanned_files']}，成功处理 {result['repaired_files']}，"
+            f"失败 {result['failed_files']}，退出码 {proc.returncode}。"
+        )
+    else:
+        result["status"] = "failed"
+        detail = next((line for line in reversed(combined_lines) if "ERROR" in line or "FATAL" in line), "")
+        result["warnings"].append(detail or f"顶点修复工具退出码: {proc.returncode}")
+
+    return result
 
 
 def mask_token(token):
@@ -1664,6 +1834,8 @@ class FiveMDecryptor:
         item = {
             "name": resource_name,
             "status": "pending",
+            "is_fxap": False,
+            "output_dir": str((Path(self.OutputDir) / resource_name).resolve()),
             "resource_id": "",
             "files_total": 0,
             "decrypted_files": 0,
@@ -1680,6 +1852,8 @@ class FiveMDecryptor:
                 item["status"] = "copied"
                 self.resource_reports.append(item)
                 return item
+
+            item["is_fxap"] = True
 
             fxap_buffer = self.decrypt_file(fxap_file, self.DefaultKey)
             if not fxap_buffer:
@@ -1860,6 +2034,7 @@ def parse_args(argv):
     parser.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB, help="输出与临时磁盘必须保留的最小空间（GB）")
     parser.add_argument("--non-interactive", action="store_true", help="非交互模式，缺少必要信息时直接失败")
     parser.add_argument("--keep-temp", action="store_true", help="保留本次运行的临时工作区；默认逐资源处理后清理")
+    parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行顶点修复")
     return parser.parse_args(argv)
 
 
@@ -1907,6 +2082,7 @@ def build_markdown_report(report):
         "",
         f"- 服务器 Dump: {'包含' if scope.get('serverDump') else '不包含'}",
         f"- FXAP 解密: {'包含' if scope.get('fxapDecrypt') else '不包含'}",
+        f"- 顶点修复: {'包含（可选）' if scope.get('vertexFix') else '不包含'}",
         f"- 模型修复: {'包含' if scope.get('modelRepair') else '不包含'}",
         "",
         "## 存储与临时目录",
@@ -1938,6 +2114,19 @@ def build_markdown_report(report):
         f"- 失败文件数: {summary.get('failed_files', 0)}",
         f"- 警告: {summary.get('warnings', 0)}",
         f"- 错误: {summary.get('errors', 0)}",
+        "",
+        "## 顶点修复",
+        "",
+        f"- 启用: {'是' if report.get('vertex_fix', {}).get('enabled') else '否'}",
+        f"- 状态: {report.get('vertex_fix', {}).get('status', 'disabled')}",
+        f"- 原解密目录: {report.get('vertex_fix', {}).get('source_output', report.get('output', ''))}",
+        f"- 修复副本目录: {report.get('vertex_fix', {}).get('output', '')}",
+        f"- 符合条件的 FXAP 资源: {report.get('vertex_fix', {}).get('resources_eligible', 0)}",
+        f"- 已复制完整资源: {report.get('vertex_fix', {}).get('resources_copied', 0)}",
+        f"- 扫描文件: {report.get('vertex_fix', {}).get('scanned_files', 0)}",
+        f"- 成功处理: {report.get('vertex_fix', {}).get('repaired_files', 0)}",
+        f"- 失败文件: {report.get('vertex_fix', {}).get('failed_files', 0)}",
+        f"- 风险提示: {report.get('vertex_fix', {}).get('disclaimer', VERTEX_FIX_DISCLAIMER)}",
         "",
         "## Dump 资源",
         "",
@@ -2136,7 +2325,22 @@ def run_tool(args):
         "scope": {
             "serverDump": True,
             "fxapDecrypt": True,
+            "vertexFix": bool(args.vertex_fix),
             "modelRepair": False,
+        },
+        "vertex_fix": {
+            "enabled": bool(args.vertex_fix),
+            "status": "pending" if args.vertex_fix else "disabled",
+            "source_output": str(output_dir),
+            "output": "",
+            "resources_eligible": 0,
+            "resources_copied": 0,
+            "scanned_files": 0,
+            "repaired_files": 0,
+            "failed_files": 0,
+            "exit_code": None,
+            "warnings": [],
+            "disclaimer": VERTEX_FIX_DISCLAIMER,
         },
         "summary": {},
         "dump_summary": {},
@@ -2177,6 +2381,9 @@ def run_tool(args):
             "warnings": warnings,
             "errors": errors,
             "output_files": count_files(output_dir),
+            "vertex_fix_scanned_files": int((report.get("vertex_fix") or {}).get("scanned_files", 0)),
+            "vertex_fix_repaired_files": int((report.get("vertex_fix") or {}).get("repaired_files", 0)),
+            "vertex_fix_failed_files": int((report.get("vertex_fix") or {}).get("failed_files", 0)),
         }
 
     try:
@@ -2187,7 +2394,12 @@ def run_tool(args):
         report["storage"]["temp_initial_free_gb"] = temp_space["free_gb"]
 
         print("=== FiveM 服务器 Dump 与 FXAP 解密工具 ===")
-        print("功能范围: 包含服务器 Dump、FXAP 解密；不包含模型修复。")
+        feature_text = "包含服务器 Dump、FXAP 解密"
+        if args.vertex_fix:
+            feature_text += "、解密后顶点修复副本"
+        print(f"功能范围: {feature_text}；不包含完整模型修复。")
+        if args.vertex_fix:
+            print(f"[顶点修复提示] {VERTEX_FIX_DISCLAIMER}")
         print(f"[存储] 输出目录: {output_dir}")
         print(f"[存储] 临时工作区: {work_dir}")
         print(
@@ -2250,6 +2462,29 @@ def run_tool(args):
         print("[Dump] 服务器 Dump 阶段完成。")
         emit_progress(88, "fxap", "逐资源 FXAP 解密阶段完成。")
         print("[FXAP] FXAP 解密流程结束。")
+
+        if args.vertex_fix:
+            emit_progress(90, "vertex_fix", "正在复制已解密的 FXAP 完整资源并执行顶点修复。")
+            try:
+                report["vertex_fix"] = run_vertex_fix(
+                    decryptor.resource_reports,
+                    output_dir,
+                    output_guard=output_guard,
+                )
+                for warning in report["vertex_fix"].get("warnings", []):
+                    report["warnings"].append(warning)
+                if report["vertex_fix"].get("status") == "success":
+                    emit_progress(94, "vertex_fix", "顶点修复副本已生成。")
+                elif report["vertex_fix"].get("status") == "skipped":
+                    emit_progress(94, "vertex_fix", "没有符合条件的 FXAP 资源，已跳过顶点修复。")
+                else:
+                    emit_progress(94, "vertex_fix", "顶点修复副本已生成，但存在失败项，请查看报告。")
+            except Exception as exc:
+                message = f"顶点修复阶段失败，原解密输出未受影响: {exc}"
+                print_warning(message)
+                report["vertex_fix"]["status"] = "failed"
+                report["vertex_fix"]["warnings"].append(message)
+                report["warnings"].append(message)
 
     except ResourceSelectionCancelled as exc:
         exit_code = 3

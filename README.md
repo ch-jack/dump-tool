@@ -6,15 +6,17 @@
 
 - 包含：服务器 Dump
 - 包含：FXAP 解密
-- 不包含：模型修复
+- 可选：仅对本次已解密的 FXAP 资源生成完整副本，并对副本执行顶点修复
+- 不包含：完整模型修复
 
-说明：仓库内仍保留原工具自带的模型修复相关文件，但该功能存在已知问题，本工具箱接入不会调用模型修复。
+顶点修复不等于模型修复，不一定能 100% 修复模型，也不保证修复后的模型可以被 FiveM 加载。如需修复模型，可以进群找群主免费修复。
 
 ## 环境要求
 
 - Windows 10 / Windows 11
 - Python 3.7 或更高版本
 - Java 8 或更高版本（推荐 Java 17，用于运行 `unluac54.jar`）
+- 可选顶点修复需要 .NET 8 Runtime
 - FiveM 已安装并已进入目标服务器
 - 需要读取 FiveM 进程 token 时，建议以管理员身份运行
 
@@ -50,6 +52,7 @@ python auto.py
 python auto.py https://cfx.re/join/xxxx --token-choice 1
 python auto.py 1.2.3.4:30120 --token-choice 1
 python auto.py 1.2.3.4:30120 --token-choice 1 --java "C:\Program Files\Eclipse Adoptium\jre-17"
+python auto.py 1.2.3.4:30120 --token-choice 1 --vertex-fix
 ```
 
 非交互模式，供 CK 工具箱调用：
@@ -88,6 +91,8 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 - 报告会记录实际 Java 路径、版本以及 Lua 反编译失败明细
 - `unluac54.jar` 失败时保留 `.luac` 字节码和错误文件，不再伪装成解密成功的 `.lua`
 - 执行过程中会输出 `CK_PROGRESS` 进度事件，供 CK 工具箱实时显示
+- `--vertex-fix` 只处理本次确认含 `.fxap` 且已完成解密的资源；原解密目录不会被覆盖
+- 顶点修复会在原输出目录同级创建“原目录名_顶点修复”，复制每个符合条件资源的完整目录后再处理副本；同名目录已存在时自动使用时间戳新目录
 
 ## 注意事项
 
