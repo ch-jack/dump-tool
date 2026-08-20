@@ -30,6 +30,12 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+for _console_stream in (sys.stdout, sys.stderr):
+    try:
+        _console_stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 TOOL_VERSION = "1.1.9"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
@@ -98,15 +104,6 @@ if kernel32:
     ]
 
 
-def emit_progress(percent, stage, message):
-    payload = {
-        "percent": max(0, min(100, int(percent))),
-        "stage": str(stage),
-        "message": str(message),
-    }
-    print("CK_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
-
-
 def print_external_line(prefix, value):
     message = f"{prefix}{value}"
     try:
@@ -115,6 +112,15 @@ def print_external_line(prefix, value):
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         safe_message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
         print(safe_message, flush=True)
+
+
+def emit_progress(percent, stage, message):
+    payload = {
+        "percent": max(0, min(100, int(percent))),
+        "stage": str(stage),
+        "message": str(message),
+    }
+    print_external_line("", "CK_PROGRESS " + json.dumps(payload, ensure_ascii=False))
 
 
 def now_iso():
@@ -424,11 +430,11 @@ def load_resource_selection_file(file_path):
 
 
 def print_warning(message):
-    print(f"[警告] {message}", flush=True)
+    print_external_line("[警告] ", message)
 
 
 def print_error(message):
-    print(f"[错误] {message}", flush=True)
+    print_external_line("[错误] ", message)
 
 
 class DiskSpaceError(RuntimeError):
