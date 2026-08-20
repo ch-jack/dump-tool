@@ -23,6 +23,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test download retry behavior
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw "Download retry tests failed: $LASTEXITCODE" }
+
       - name: Prepare release metadata
         shell: pwsh
         run: |

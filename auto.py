@@ -9,6 +9,7 @@ import hmac
 import ipaddress
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -29,10 +30,15 @@ from Crypto.Util.Padding import unpad
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TOOL_VERSION = "1.1.8"
+TOOL_VERSION = "1.1.9"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
+DOWNLOAD_MAX_ATTEMPTS = 4
+DOWNLOAD_RETRY_BASE_SECONDS = 1.0
+DOWNLOAD_RETRY_MAX_SECONDS = 8.0
+DOWNLOAD_RETRY_AFTER_MAX_SECONDS = 30.0
+DOWNLOAD_RETRY_STATUS_CODES = {403, 404, 408, 409, 425, 429, 500, 502, 503, 504}
 VERTEX_FIXER_CLI = SCRIPT_DIR / "FIXER" / "FivemDecryptFixer.Cli.exe"
 VERTEX_FIX_EXTENSIONS = {".ydr", ".yft", ".ydd"}
 VERTEX_FIX_DISCLAIMER = (
@@ -778,6 +784,10 @@ class FiveMDumper:
             "resources_total": 0,
             "resources_selected": 0,
             "downloaded_files": 0,
+            "download_retried_files": 0,
+            "download_retry_attempts": 0,
+            "download_retry_recovered": 0,
+            "failed_downloads": 0,
             "failed_files": 0,
             "rpf_unpacked": 0,
             "warnings": 0,
@@ -835,20 +845,102 @@ class FiveMDumper:
         print(f"[配置] 服务器返回 {len(resources)} 个资源。")
         return resources
 
-    def download_and_decrypt(self, url, key, iv, out_path, file_name):
-        try:
-            resp = self.session.get(url, timeout=60)
-            resp.raise_for_status()
+    def _download_retry_delay(self, response, attempt):
+        if response is not None:
+            retry_after = str(response.headers.get("Retry-After", "") or "").strip()
+            try:
+                if retry_after:
+                    return min(DOWNLOAD_RETRY_AFTER_MAX_SECONDS, max(0.0, float(retry_after)))
+            except (TypeError, ValueError):
+                pass
+        base_delay = DOWNLOAD_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1))
+        jittered_delay = base_delay * random.uniform(0.8, 1.2)
+        return min(DOWNLOAD_RETRY_MAX_SECONDS, jittered_delay)
 
+    def _download_failure(self, file_name, attempts, error, status_code=None):
+        return {
+            "path": None,
+            "file": file_name,
+            "bytes": 0,
+            "attempts": int(attempts),
+            "retries": max(0, int(attempts) - 1),
+            "status_code": status_code,
+            "failure_stage": "download",
+            "error": str(error),
+        }
+
+    def download_and_decrypt(self, url, key, iv, out_path, file_name, resource_name=""):
+        encrypted = None
+        attempts = 0
+        status_code = None
+        retryable_exceptions = (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ContentDecodingError,
+        )
+
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            attempts = attempt
+            status_code = None
+            response = None
+            try:
+                response = self.session.get(url, timeout=(15, 60))
+                status_code = int(response.status_code)
+                if 200 <= status_code < 300:
+                    encrypted = response.content
+                    break
+
+                reason = str(response.reason or "HTTP 请求失败").strip()
+                error = f"HTTP {status_code} {reason}".strip()
+                if status_code not in DOWNLOAD_RETRY_STATUS_CODES or attempt >= DOWNLOAD_MAX_ATTEMPTS:
+                    return self._download_failure(file_name, attempts, error, status_code)
+
+                delay = self._download_retry_delay(response, attempt)
+                print_warning(
+                    f"[下载重试] {resource_name}/{file_name} 第 {attempt}/{DOWNLOAD_MAX_ATTEMPTS} 次请求返回 "
+                    f"HTTP {status_code}，{delay:.1f} 秒后重试。"
+                )
+            except retryable_exceptions as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                if attempt >= DOWNLOAD_MAX_ATTEMPTS:
+                    return self._download_failure(file_name, attempts, error, status_code)
+                delay = self._download_retry_delay(None, attempt)
+                print_warning(
+                    f"[下载重试] {resource_name}/{file_name} 第 {attempt}/{DOWNLOAD_MAX_ATTEMPTS} 次请求异常："
+                    f"{error}；{delay:.1f} 秒后重试。"
+                )
+            except requests.exceptions.RequestException as exc:
+                return self._download_failure(file_name, attempts, f"{type(exc).__name__}: {exc}", status_code)
+            except Exception as exc:
+                return self._download_failure(file_name, attempts, f"{type(exc).__name__}: {exc}", status_code)
+            finally:
+                if response is not None:
+                    response.close()
+
+            time.sleep(delay)
+
+        if encrypted is None:
+            return self._download_failure(file_name, attempts, "服务器没有返回文件内容", status_code)
+
+        try:
             try:
                 cipher = ChaCha20.new(key=key, nonce=iv)
-                dec = cipher.decrypt(resp.content)
+                dec = cipher.decrypt(encrypted)
             except Exception:
                 try:
                     cipher = ChaCha20.new(key=key, nonce=iv[:8])
-                    dec = cipher.decrypt(resp.content)
+                    dec = cipher.decrypt(encrypted)
                 except Exception as exc:
-                    return {"path": None, "file": file_name, "error": f"ChaCha20 解密失败: {exc}"}
+                    return {
+                        "path": None,
+                        "file": file_name,
+                        "attempts": attempts,
+                        "retries": max(0, attempts - 1),
+                        "status_code": status_code,
+                        "failure_stage": "decrypt",
+                        "error": f"ChaCha20 解密失败: {exc}",
+                    }
 
             if out_path.lower().endswith(".rpf") and not dec.startswith(b"RPF"):
                 print_warning(f"{file_name} 的 RPF 文件头不完整，继续保存并尝试后续处理。")
@@ -859,19 +951,52 @@ class FiveMDumper:
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 with open(out_path, "wb") as f:
                     f.write(dec)
-                return {"path": out_path, "file": file_name, "bytes": len(dec), "error": ""}
+                return {
+                    "path": out_path,
+                    "file": file_name,
+                    "bytes": len(dec),
+                    "attempts": attempts,
+                    "retries": max(0, attempts - 1),
+                    "status_code": status_code,
+                    "failure_stage": "",
+                    "error": "",
+                }
             except DiskSpaceError:
                 raise
             except OSError as exc:
                 if is_disk_full_error(exc) and self.work_guard:
                     self.work_guard.raise_write_error(exc)
-                return {"path": None, "file": file_name, "error": f"写入文件失败: {exc}"}
+                return {
+                    "path": None,
+                    "file": file_name,
+                    "attempts": attempts,
+                    "retries": max(0, attempts - 1),
+                    "status_code": status_code,
+                    "failure_stage": "write",
+                    "error": f"写入文件失败: {exc}",
+                }
             except Exception as exc:
-                return {"path": None, "file": file_name, "error": f"写入文件失败: {exc}"}
+                return {
+                    "path": None,
+                    "file": file_name,
+                    "attempts": attempts,
+                    "retries": max(0, attempts - 1),
+                    "status_code": status_code,
+                    "failure_stage": "write",
+                    "error": f"写入文件失败: {exc}",
+                }
         except DiskSpaceError:
             raise
         except Exception as exc:
-            return {"path": None, "file": file_name, "error": f"下载失败: {exc}"}
+            return {
+                "path": None,
+                "file": file_name,
+                "attempts": attempts,
+                "retries": max(0, attempts - 1),
+                "status_code": status_code,
+                "failure_stage": "process",
+                "error": f"文件处理失败: {exc}",
+            }
 
     def unpack_rpf(self, rpf_path, out_dir, item):
         unpacker = str((SCRIPT_DIR / "Bin" / "Unpacker.exe").resolve())
@@ -945,6 +1070,10 @@ class FiveMDumper:
             "status": "pending",
             "files_total": 0,
             "downloaded_files": 0,
+            "download_retried_files": 0,
+            "download_retry_attempts": 0,
+            "download_retry_recovered": 0,
+            "failed_downloads": [],
             "failed_files": 0,
             "rpf_unpacked": 0,
             "warnings": [],
@@ -973,7 +1102,12 @@ class FiveMDumper:
         for fname, file_data in files.items():
             hsh = get_file_hash(file_data)
             if not hsh:
-                self.warn(item, f"Missing hash, skipped: {fname}")
+                detail = {"file": fname, "attempts": 0, "status_code": None, "error": "文件缺少 hash，无法下载"}
+                item["failed_downloads"].append(detail)
+                item["failed_files"] += 1
+                self.summary["failed_downloads"] += 1
+                self.summary["failed_files"] += 1
+                self.warn(item, f"[下载最终失败] {resource_name}/{fname}：文件缺少 hash，无法下载。")
                 continue
             base_url = (res.get("fileServer") or self.base_url + "/files").rstrip("/")
             url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
@@ -984,7 +1118,12 @@ class FiveMDumper:
         for fname, body in stream_files.items():
             hsh = get_file_hash(body)
             if not hsh:
-                self.warn(item, f"Missing stream hash, skipped: {fname}")
+                detail = {"file": fname, "attempts": 0, "status_code": None, "error": "stream 文件缺少 hash，无法下载"}
+                item["failed_downloads"].append(detail)
+                item["failed_files"] += 1
+                self.summary["failed_downloads"] += 1
+                self.summary["failed_files"] += 1
+                self.warn(item, f"[下载最终失败] {resource_name}/{fname}：stream 文件缺少 hash，无法下载。")
                 continue
             base_url = (res.get("fileServer") or self.base_url + "/files").rstrip("/")
             url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
@@ -997,7 +1136,7 @@ class FiveMDumper:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as exe:
             future_map = {
-                exe.submit(self.download_and_decrypt, url, key, iv_value, out_path, fname): (fname, out_path)
+                exe.submit(self.download_and_decrypt, url, key, iv_value, out_path, fname, resource_name): (fname, out_path)
                 for fname, url, key, iv_value, out_path in file_jobs
             }
             for future in as_completed(future_map):
@@ -1010,18 +1149,53 @@ class FiveMDumper:
                         pending.cancel()
                     raise
                 except Exception as exc:
-                    result = {"path": None, "file": fname, "error": str(exc)}
+                    result = {
+                        "path": None,
+                        "file": fname,
+                        "attempts": 1,
+                        "retries": 0,
+                        "status_code": None,
+                        "failure_stage": "process",
+                        "error": str(exc),
+                    }
+
+                retries = int(result.get("retries", 0) or 0)
+                if retries > 0:
+                    item["download_retried_files"] += 1
+                    item["download_retry_attempts"] += retries
+                    self.summary["download_retried_files"] += 1
+                    self.summary["download_retry_attempts"] += retries
 
                 if result.get("path"):
                     item["downloaded_files"] += 1
                     self.summary["downloaded_files"] += 1
-                    print(f"[下载完成] {fname}")
+                    if retries > 0:
+                        item["download_retry_recovered"] += 1
+                        self.summary["download_retry_recovered"] += 1
+                        print(f"[下载重试成功] {resource_name}/{fname}，共尝试 {result.get('attempts')} 次。")
+                    else:
+                        print(f"[下载完成] {fname}")
                     if fname.endswith(".rpf"):
                         rpf_files.append(result["path"])
                 else:
                     item["failed_files"] += 1
                     self.summary["failed_files"] += 1
-                    self.warn(item, f"{fname} 处理失败: {result.get('error') or '未知错误'}")
+                    if result.get("failure_stage") == "download":
+                        detail = {
+                            "file": fname,
+                            "attempts": int(result.get("attempts", 0) or 0),
+                            "status_code": result.get("status_code"),
+                            "error": result.get("error") or "未知下载错误",
+                        }
+                        item["failed_downloads"].append(detail)
+                        self.summary["failed_downloads"] += 1
+                        self.warn(
+                            item,
+                            f"[下载最终失败] {resource_name}/{fname}：共尝试 {detail['attempts']} 次；"
+                            f"{detail['error']}。",
+                        )
+                    else:
+                        self.warn(item, f"{fname} 处理失败: {result.get('error') or '未知错误'}")
 
                 base = 28
                 span = 34
@@ -2107,6 +2281,10 @@ def build_markdown_report(report):
         f"- 服务器资源总数: {summary.get('server_resources_total', 0)}",
         f"- 本次选择资源: {summary.get('server_resources_selected', 0)}",
         f"- Dump 下载成功文件: {summary.get('downloaded_files', 0)}",
+        f"- 发生过重试的文件: {summary.get('download_retried_files', 0)}",
+        f"- 下载额外重试次数: {summary.get('download_retry_attempts', 0)}",
+        f"- 重试后下载成功: {summary.get('download_retry_recovered', 0)}",
+        f"- 最终未下载成功: {summary.get('failed_downloads', 0)}",
         f"- RPF 解包成功: {summary.get('rpf_unpacked', 0)}",
         f"- FXAP 解密资源: {summary.get('resources_decrypted', 0)}",
         f"- 复制未加密资源: {summary.get('resources_copied', 0)}",
@@ -2138,6 +2316,8 @@ def build_markdown_report(report):
             lines.append(
                 f"- [{item.get('status', '')}] {item.get('name', '')}: "
                 f"下载 {item.get('downloaded_files', 0)}/{item.get('files_total', 0)}，"
+                f"重试文件 {item.get('download_retried_files', 0)}，"
+                f"最终未下载 {len(item.get('failed_downloads', []))}，"
                 f"RPF 解包 {item.get('rpf_unpacked', 0)}"
             )
             for warning in item.get("warnings", [])[:5]:
@@ -2145,6 +2325,20 @@ def build_markdown_report(report):
             for error in item.get("errors", [])[:5]:
                 lines.append(f"  - 错误: {error}")
     else:
+        lines.append("- 无")
+
+    lines.extend(["", "## 最终未下载成功文件", ""])
+    failed_download_count = 0
+    for item in dump_resources:
+        for failure in item.get("failed_downloads", []):
+            failed_download_count += 1
+            status_code = failure.get("status_code")
+            status_text = f"HTTP {status_code}" if status_code is not None else "无 HTTP 状态码"
+            lines.append(
+                f"- {item.get('name', '')}/{failure.get('file', '')}: {status_text}，"
+                f"尝试 {failure.get('attempts', 0)} 次，原因: {failure.get('error', '')}"
+            )
+    if failed_download_count == 0:
         lines.append("- 无")
 
     lines.extend(["", "## FXAP 解密资源", ""])
@@ -2372,6 +2566,10 @@ def run_tool(args):
             "server_resources_total": int(dump_summary.get("resources_total", 0)),
             "server_resources_selected": int(dump_summary.get("resources_selected", 0)),
             "downloaded_files": int(dump_summary.get("downloaded_files", 0)),
+            "download_retried_files": int(dump_summary.get("download_retried_files", 0)),
+            "download_retry_attempts": int(dump_summary.get("download_retry_attempts", 0)),
+            "download_retry_recovered": int(dump_summary.get("download_retry_recovered", 0)),
+            "failed_downloads": int(dump_summary.get("failed_downloads", 0)),
             "rpf_unpacked": int(dump_summary.get("rpf_unpacked", 0)),
             "resources_decrypted": int(decrypt_summary.get("resources_decrypted", 0)),
             "resources_copied": int(decrypt_summary.get("resources_copied", 0)),
