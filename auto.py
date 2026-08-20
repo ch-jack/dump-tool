@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.9"
+TOOL_VERSION = "1.1.10"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -1298,7 +1298,7 @@ class FiveMDumper:
         if not chosen:
             raise RuntimeError("No resources matched the requested selection")
 
-        print(f"[Dump] 将处理 {len(chosen)} 个资源，并在每个资源完成后立即解密和释放临时文件。")
+        print(f"[Dump] 将处理 {len(chosen)} 个资源，并在每个资源完成后立即执行所选处理和释放临时文件。")
         for idx, res in enumerate(chosen, start=1):
             resource_name = res.get("name", f"resource_{idx}")
             resource_safe_name = safe_name(resource_name)
@@ -1306,7 +1306,7 @@ class FiveMDumper:
                 item = self.fetch_resource(res, idx, len(chosen))
                 unpacked_dir = os.path.join("Unpacked", resource_safe_name)
                 if on_resource_ready and os.path.isdir(unpacked_dir):
-                    on_resource_ready(unpacked_dir, resource_safe_name)
+                    on_resource_ready(unpacked_dir, resource_safe_name, item)
             finally:
                 if not self.keep_temp:
                     self.cleanup_resource_temp(resource_safe_name)
@@ -1314,7 +1314,7 @@ class FiveMDumper:
 
 
 class FiveMDecryptor:
-    def __init__(self, output_dir="Output", java_executable="", work_guard=None, output_guard=None):
+    def __init__(self, output_dir="Output", java_executable="", work_guard=None, output_guard=None, require_java=True):
         self.DefaultKey = bytes([
             0xB3, 0xCB, 0x2E, 0x04, 0x87, 0x94, 0xD6, 0x73,
             0x08, 0x23, 0xC4, 0x93, 0x7A, 0xBD, 0x18, 0xAD,
@@ -1332,11 +1332,12 @@ class FiveMDecryptor:
         self.OutputDir = str(output_dir)
         self.WorkGuard = work_guard
         self.OutputGuard = output_guard
+        self.RequireJava = bool(require_java)
         self.JavaExecutable = os.path.abspath(java_executable) if java_executable else ""
-        if not self.JavaExecutable or not os.path.isfile(self.JavaExecutable):
+        if self.RequireJava and (not self.JavaExecutable or not os.path.isfile(self.JavaExecutable)):
             raise RuntimeError("Java 环境未就绪，无法运行 unluac54.jar。")
         self.UnluacJar = str((SCRIPT_DIR / "Tools" / "Decompile" / "unluac54.jar").resolve())
-        if not os.path.isfile(self.UnluacJar):
+        if self.RequireJava and not os.path.isfile(self.UnluacJar):
             raise RuntimeError(f"缺少 Lua 5.4 反编译器: {self.UnluacJar}")
         self.TempDir = "TempCompiled"
         self.KeymasterUrl = "https://keymaster.fivem.net/api/validate"
@@ -1344,6 +1345,7 @@ class FiveMDecryptor:
             "resources_total": 0,
             "resources_decrypted": 0,
             "resources_copied": 0,
+            "resources_raw_preserved": 0,
             "decrypted_files": 0,
             "copied_files": 0,
             "failed_files": 0,
@@ -1978,7 +1980,7 @@ class FiveMDecryptor:
             grants_token = f.read().strip()
         return {"success": True, "grants_token": grants_token}
 
-    def copy_plain_resource(self, resource_path, resource_name, item):
+    def copy_plain_resource(self, resource_path, resource_name, item, description="未加密资源"):
         copied = 0
         for file_full in self.get_all_files(resource_path):
             try:
@@ -2005,7 +2007,56 @@ class FiveMDecryptor:
         item["copied_files"] += copied
         self.summary["copied_files"] += copied
         self.summary["resources_copied"] += 1
-        print(f"[复制完成] 未加密资源已复制: {resource_name}，文件 {copied} 个。")
+        print(f"[复制完成] {description}已复制: {resource_name}，文件 {copied} 个。")
+
+    def preserve_raw_resource(self, resource_path, resource_name, source_complete=True, source_failed_files=0):
+        self.summary["resources_total"] += 1
+        if self.OutputGuard:
+            self.OutputGuard.check(force=True)
+        item = {
+            "name": resource_name,
+            "status": "pending",
+            "is_fxap": os.path.isfile(os.path.join(resource_path, ".fxap")),
+            "raw_preserved": True,
+            "source_complete": bool(source_complete),
+            "source_failed_files": int(source_failed_files or 0),
+            "output_dir": str((Path(self.OutputDir) / resource_name).resolve()),
+            "resource_id": "",
+            "files_total": len(self.get_all_files(resource_path)),
+            "decrypted_files": 0,
+            "copied_files": 0,
+            "failed_files": 0,
+            "warnings": [],
+            "errors": [],
+        }
+
+        try:
+            self.copy_plain_resource(
+                resource_path,
+                resource_name,
+                item,
+                description="原始资源（未执行 FXAP 解密）",
+            )
+            if item["failed_files"] == 0 and item["source_complete"]:
+                item["status"] = "raw_preserved"
+                self.summary["resources_raw_preserved"] += 1
+            elif item["copied_files"] > 0:
+                item["status"] = "partial"
+                if not item["source_complete"]:
+                    self.warn(
+                        item,
+                        f"下载阶段有 {item['source_failed_files']} 个文件失败；已保留现有原始目录，但内容不完整。",
+                    )
+            else:
+                item["status"] = "failed"
+        except DiskSpaceError:
+            raise
+        except Exception as exc:
+            self.error(item, f"原始资源保留失败: {resource_name}，{exc}")
+            item["status"] = "failed"
+
+        self.resource_reports.append(item)
+        return item
 
     def decrypt_resource(self, resource_path, resource_name, grants_token=None):
         self.summary["resources_total"] += 1
@@ -2207,13 +2258,14 @@ def parse_args(argv):
     parser.add_argument("--resources", default=None, help="资源选择：支持 all、序号、精确名称和 *、? 通配符，多个条件用逗号分隔；非交互模式默认 all")
     parser.add_argument("--resources-file", default="", help="包含精确资源名数组的 JSON 文件")
     parser.add_argument("--list-resources", action="store_true", help="仅获取并输出服务器资源清单，不执行 Dump")
-    parser.add_argument("--output", default="Output", help="解密输出目录")
+    parser.add_argument("--output", default="Output", help="Dump 处理输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
     parser.add_argument("--java", default="", help="Java 安装目录或 java.exe；最低 Java 8，推荐 Java 17")
     parser.add_argument("--temp-dir", default="", help="临时工作区的父目录；默认使用输出目录所在磁盘")
     parser.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB, help="输出与临时磁盘必须保留的最小空间（GB）")
     parser.add_argument("--non-interactive", action="store_true", help="非交互模式，缺少必要信息时直接失败")
     parser.add_argument("--keep-temp", action="store_true", help="保留本次运行的临时工作区；默认逐资源处理后清理")
+    parser.add_argument("--no-fxap-decrypt", action="store_true", help="不执行 FXAP 解密，将下载、解包后的原始资源（含 .fxap）按完整目录复制到输出")
     parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行顶点修复")
     return parser.parse_args(argv)
 
@@ -2262,6 +2314,7 @@ def build_markdown_report(report):
         "",
         f"- 服务器 Dump: {'包含' if scope.get('serverDump') else '不包含'}",
         f"- FXAP 解密: {'包含' if scope.get('fxapDecrypt') else '不包含'}",
+        f"- 原始 FXAP 资源完整保留: {'包含' if scope.get('rawResourcePreservation') else '不包含'}",
         f"- 顶点修复: {'包含（可选）' if scope.get('vertexFix') else '不包含'}",
         f"- 模型修复: {'包含' if scope.get('modelRepair') else '不包含'}",
         "",
@@ -2277,7 +2330,8 @@ def build_markdown_report(report):
         "",
         "## Java 环境",
         "",
-        f"- 状态: {'已就绪' if java.get('ok') else '不可用'}",
+        f"- 本次是否需要: {'是' if java.get('required', True) else '否'}",
+        f"- 状态: {'已就绪' if java.get('ok') else ('未检测（本次不需要）' if not java.get('required', True) else '不可用')}",
         f"- 版本: {java.get('version', '')}",
         f"- 路径: {java.get('path', '')}",
         f"- 要求: 最低 Java {JAVA_MINIMUM_MAJOR}，推荐 Java {JAVA_RECOMMENDED_MAJOR}",
@@ -2293,7 +2347,8 @@ def build_markdown_report(report):
         f"- 最终未下载成功: {summary.get('failed_downloads', 0)}",
         f"- RPF 解包成功: {summary.get('rpf_unpacked', 0)}",
         f"- FXAP 解密资源: {summary.get('resources_decrypted', 0)}",
-        f"- 复制未加密资源: {summary.get('resources_copied', 0)}",
+        f"- 复制资源: {summary.get('resources_copied', 0)}",
+        f"- 完整保留原始资源: {summary.get('resources_raw_preserved', 0)}",
         f"- 输出文件数: {summary.get('output_files', 0)}",
         f"- 失败文件数: {summary.get('failed_files', 0)}",
         f"- 警告: {summary.get('warnings', 0)}",
@@ -2364,7 +2419,25 @@ def build_markdown_report(report):
     else:
         lines.append("- 无")
 
-    if len(dump_resources) > 200 or len(decrypt_resources) > 200:
+    lines.extend(["", "## 原始资源完整保留", ""])
+    raw_resources = report.get("raw_resources", [])
+    if raw_resources:
+        for item in raw_resources[:200]:
+            lines.append(
+                f"- [{item.get('status', '')}] {item.get('name', '')}: "
+                f"FXAP {'是' if item.get('is_fxap') else '否'}，"
+                f"下载源 {'完整' if item.get('source_complete', True) else '不完整'}，"
+                f"完整目录文件 {item.get('copied_files', 0)}/{item.get('files_total', 0)}，"
+                f"失败 {item.get('failed_files', 0)}，输出 {item.get('output_dir', '')}"
+            )
+            for warning in item.get("warnings", [])[:5]:
+                lines.append(f"  - 警告: {warning}")
+            for error in item.get("errors", [])[:5]:
+                lines.append(f"  - 错误: {error}")
+    else:
+        lines.append("- 无")
+
+    if len(dump_resources) > 200 or len(decrypt_resources) > 200 or len(raw_resources) > 200:
         lines.extend(["", "仅显示前 200 个资源，完整明细请查看 JSON 报告。"])
 
     return "\n".join(lines) + "\n"
@@ -2480,6 +2553,7 @@ def run_tool(args):
     os.chdir(SCRIPT_DIR)
     start_time = time.time()
     started_at = now_iso()
+    decrypt_enabled = not bool(args.no_fxap_decrypt)
 
     output_dir = Path(args.output)
     if not output_dir.is_absolute():
@@ -2508,6 +2582,7 @@ def run_tool(args):
         "resources_requested": args.resources_file or args.resources or ("all" if args.non_interactive else ""),
         "java": {
             "ok": False,
+            "required": decrypt_enabled,
             "requested": args.java or "",
             "path": "",
             "version": "",
@@ -2524,7 +2599,8 @@ def run_tool(args):
         },
         "scope": {
             "serverDump": True,
-            "fxapDecrypt": True,
+            "fxapDecrypt": decrypt_enabled,
+            "rawResourcePreservation": not decrypt_enabled,
             "vertexFix": bool(args.vertex_fix),
             "modelRepair": False,
         },
@@ -2547,6 +2623,7 @@ def run_tool(args):
         "decrypt_summary": {},
         "dump_resources": [],
         "decrypt_resources": [],
+        "raw_resources": [],
         "warnings": [],
         "errors": [],
     }
@@ -2561,7 +2638,12 @@ def run_tool(args):
             report["dump_resources"] = dumper.resource_reports
         if decryptor is not None:
             report["decrypt_summary"] = decryptor.summary
-            report["decrypt_resources"] = decryptor.resource_reports
+            if decrypt_enabled:
+                report["decrypt_resources"] = decryptor.resource_reports
+                report["raw_resources"] = []
+            else:
+                report["decrypt_resources"] = []
+                report["raw_resources"] = decryptor.resource_reports
 
         dump_summary = report.get("dump_summary") or {}
         decrypt_summary = report.get("decrypt_summary") or {}
@@ -2579,6 +2661,7 @@ def run_tool(args):
             "rpf_unpacked": int(dump_summary.get("rpf_unpacked", 0)),
             "resources_decrypted": int(decrypt_summary.get("resources_decrypted", 0)),
             "resources_copied": int(decrypt_summary.get("resources_copied", 0)),
+            "resources_raw_preserved": int(decrypt_summary.get("resources_raw_preserved", 0)),
             "decrypted_files": int(decrypt_summary.get("decrypted_files", 0)),
             "copied_files": int(decrypt_summary.get("copied_files", 0)),
             "failed_files": failed_files,
@@ -2591,6 +2674,8 @@ def run_tool(args):
         }
 
     try:
+        if args.vertex_fix and not decrypt_enabled:
+            raise RuntimeError("顶点修复依赖 FXAP 解密；选择不解密时不能同时启用顶点修复。")
         os.chdir(work_dir)
         output_space = output_guard.check(force=True)
         temp_space = work_guard.check(force=True)
@@ -2598,7 +2683,11 @@ def run_tool(args):
         report["storage"]["temp_initial_free_gb"] = temp_space["free_gb"]
 
         print("=== FiveM 服务器 Dump 与 FXAP 解密工具 ===")
-        feature_text = "包含服务器 Dump、FXAP 解密"
+        feature_text = "包含服务器 Dump"
+        if decrypt_enabled:
+            feature_text += "、FXAP 解密"
+        else:
+            feature_text += "、原始 FXAP 资源完整保留（不解密）"
         if args.vertex_fix:
             feature_text += "、解密后顶点修复副本"
         print(f"功能范围: {feature_text}；不包含完整模型修复。")
@@ -2610,16 +2699,30 @@ def run_tool(args):
             f"[存储] 输出盘剩余 {output_space['free_gb']} GB，临时盘剩余 {temp_space['free_gb']} GB，"
             f"安全保留 {minimum_free_gb} GB。"
         )
-        print("[存储] 默认逐资源下载、解密并清理临时文件，不再把整个服务器临时数据堆在工具安装盘。")
+        print("[存储] 默认逐资源下载、执行所选处理并清理临时文件，不再把整个服务器临时数据堆在工具安装盘。")
         print()
 
-        emit_progress(2, "java", "正在检测 Java 环境。")
-        java_info = resolve_java_executable(args.java)
-        java_info["requested"] = args.java or ""
-        report["java"] = java_info
-        print(f"[Java] 已就绪: {java_info['version']} ({java_info['path']})")
-        if int(java_info.get("major", 0)) < JAVA_RECOMMENDED_MAJOR:
-            print(f"[Java] 当前版本可用，推荐升级到 Java {JAVA_RECOMMENDED_MAJOR}。")
+        if decrypt_enabled:
+            emit_progress(2, "java", "正在检测 Java 环境。")
+            java_info = resolve_java_executable(args.java)
+            java_info["requested"] = args.java or ""
+            java_info["required"] = True
+            report["java"] = java_info
+            print(f"[Java] 已就绪: {java_info['version']} ({java_info['path']})")
+            if int(java_info.get("major", 0)) < JAVA_RECOMMENDED_MAJOR:
+                print(f"[Java] 当前版本可用，推荐升级到 Java {JAVA_RECOMMENDED_MAJOR}。")
+        else:
+            java_info = {
+                "ok": False,
+                "required": False,
+                "requested": args.java or "",
+                "path": "",
+                "version": "",
+                "major": None,
+            }
+            report["java"] = java_info
+            emit_progress(2, "raw", "本次不解密 FXAP，无需 Java 环境。")
+            print("[Java] 本次选择保留原始资源，不执行 FXAP 解密，无需 Java。")
 
         target = (args.target or "").strip()
         if not target and not args.non_interactive:
@@ -2641,12 +2744,14 @@ def run_tool(args):
         report["base_url"] = endpoint["base_urls"][0]
         print(f"[地址] 服务器地址: {endpoint['address']}")
 
-        emit_progress(24, "dump", "开始服务器 Dump，并逐资源进行 FXAP 解密。")
+        next_stage_text = "逐资源进行 FXAP 解密" if decrypt_enabled else "逐资源完整保留原始内容"
+        emit_progress(24, "dump", f"开始服务器 Dump，并{next_stage_text}。")
         decryptor = FiveMDecryptor(
             output_dir=str(output_dir),
             java_executable=java_info["path"],
             work_guard=work_guard,
             output_guard=output_guard,
+            require_java=decrypt_enabled,
         )
         dumper = FiveMDumper(
             report["base_url"],
@@ -2657,15 +2762,28 @@ def run_tool(args):
             fallback_base_urls=endpoint["base_urls"][1:],
         )
 
-        def decrypt_ready_resource(resource_path, resource_name):
-            print(f"[流水线] Dump 完成，立即处理 FXAP 并释放临时文件: {resource_name}")
-            decryptor.decrypt_resource(resource_path, resource_name)
+        def process_ready_resource(resource_path, resource_name, dump_item):
+            if decrypt_enabled:
+                print(f"[流水线] Dump 完成，立即处理 FXAP 并释放临时文件: {resource_name}")
+                decryptor.decrypt_resource(resource_path, resource_name)
+            else:
+                print(f"[流水线] Dump 完成，立即完整复制原始资源（含 .fxap）并释放临时文件: {resource_name}")
+                decryptor.preserve_raw_resource(
+                    resource_path,
+                    resource_name,
+                    source_complete=int(dump_item.get("failed_files", 0) or 0) == 0,
+                    source_failed_files=int(dump_item.get("failed_files", 0) or 0),
+                )
 
-        dumper.run(resources_choice, on_resource_ready=decrypt_ready_resource)
+        dumper.run(resources_choice, on_resource_ready=process_ready_resource)
         report["base_url"] = dumper.base_url
         print("[Dump] 服务器 Dump 阶段完成。")
-        emit_progress(88, "fxap", "逐资源 FXAP 解密阶段完成。")
-        print("[FXAP] FXAP 解密流程结束。")
+        if decrypt_enabled:
+            emit_progress(88, "fxap", "逐资源 FXAP 解密阶段完成。")
+            print("[FXAP] FXAP 解密流程结束。")
+        else:
+            emit_progress(88, "raw", "原始资源完整保留阶段完成。")
+            print("[原始保留] 未执行 FXAP 解密，完整资源目录已复制到输出。")
 
         if args.vertex_fix:
             emit_progress(90, "vertex_fix", "正在复制已解密的 FXAP 完整资源并执行顶点修复。")

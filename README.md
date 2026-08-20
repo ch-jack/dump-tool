@@ -52,6 +52,7 @@ python auto.py
 python auto.py https://cfx.re/join/xxxx --token-choice 1
 python auto.py 1.2.3.4:30120 --token-choice 1
 python auto.py 1.2.3.4:30120 --token-choice 1 --java "C:\Program Files\Eclipse Adoptium\jre-17"
+python auto.py 1.2.3.4:30120 --token-choice 1 --no-fxap-decrypt
 python auto.py 1.2.3.4:30120 --token-choice 1 --vertex-fix
 ```
 
@@ -93,6 +94,8 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 - 执行过程中会输出 `CK_PROGRESS` 进度事件，供 CK 工具箱实时显示
 - 资源文件下载遇到 HTTP 403、404、408、409、425、429、常见 5xx、连接中断或超时时，会进行最多 4 次请求（首次 + 3 次重试），采用受限退避并尊重数字形式的 `Retry-After`
 - 每次重试、重试成功和最终失败都会写入日志；JSON/Markdown 报告会逐项记录最终未下载成功的资源名、文件名、HTTP 状态码、尝试次数和失败原因
+- `--no-fxap-decrypt` 不执行 FXAP 解密，也不要求 Java；每个资源下载并解包后，会在临时目录清理前把 `.fxap`、加密文件、脚本及所有子目录按原结构完整复制到输出目录
+- `--no-fxap-decrypt` 不能与 `--vertex-fix` 同时使用；顶点修复只适用于成功解密后的副本
 - `--vertex-fix` 只处理本次确认含 `.fxap` 且已完成解密的资源；原解密目录不会被覆盖
 - 顶点修复会在原输出目录同级创建“原目录名_顶点修复”，复制每个符合条件资源的完整目录后再处理副本；同名目录已存在时自动使用时间戳新目录
 
