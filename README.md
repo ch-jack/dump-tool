@@ -54,6 +54,7 @@ python auto.py 1.2.3.4:30120 --token-choice 1
 python auto.py 1.2.3.4:30120 --token-choice 1 --java "C:\Program Files\Eclipse Adoptium\jre-17"
 python auto.py 1.2.3.4:30120 --token-choice 1 --no-fxap-decrypt
 python auto.py 1.2.3.4:30120 --token-choice 1 --vertex-fix
+python auto.py --retry-failed-report "C:\path\to\previous-report.json" --non-interactive
 ```
 
 非交互模式，供 CK 工具箱调用：
@@ -96,6 +97,9 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 - 每次重试、重试成功和最终失败都会写入日志；JSON/Markdown 报告会逐项记录最终未下载成功的资源名、文件名、HTTP 状态码、尝试次数和失败原因
 - `--no-fxap-decrypt` 不执行 FXAP 解密，也不要求 Java；每个资源下载并解包后，会在临时目录清理前把 `.fxap`、加密文件、脚本及所有子目录按原结构完整复制到输出目录
 - `--no-fxap-decrypt` 不能与 `--vertex-fix` 同时使用；顶点修复只适用于成功解密后的副本
+- `--retry-failed-report` 读取上一次 JSON 报告，只选择其中 `failed_downloads` 和等待解密前置文件的项目重新下载，并合并回报告记录的原输出目录；新报告可以继续用于下一轮补充
+- 解密模式补充 stream/普通文件时会额外下载该资源必要的 RPF/`.fxap` 上下文，否则无法安全解密；已经成功且不是解密前置的文件不会重复下载
+- 补充下载不会自动执行顶点修复；它只更新原解密输出或原始保留输出，避免覆盖已有的顶点修复副本
 - `--vertex-fix` 只处理本次确认含 `.fxap` 且已完成解密的资源；原解密目录不会被覆盖
 - 顶点修复会在原输出目录同级创建“原目录名_顶点修复”，复制每个符合条件资源的完整目录后再处理副本；同名目录已存在时自动使用时间戳新目录
 

@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.10"
+TOOL_VERSION = "1.1.11"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -429,6 +429,74 @@ def load_resource_selection_file(file_path):
     return names
 
 
+def load_failed_download_retry_report(file_path):
+    path = Path(file_path).expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"补充下载报告不存在: {path}")
+    if path.stat().st_size > 50 * 1024 * 1024:
+        raise RuntimeError(f"补充下载报告过大: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"无法读取补充下载报告 {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("command") != "server-dump":
+        raise RuntimeError("补充下载只接受 dump-tool 生成的 server-dump JSON 报告。")
+
+    target = str(payload.get("target") or "").strip()
+    output = str(payload.get("output") or "").strip()
+    if not target or not output:
+        raise RuntimeError("补充下载报告缺少目标服务器或原输出目录。")
+
+    files_by_resource = {}
+    retry_meta = payload.get("retry_failed") or {}
+    for resource_name, file_names in (retry_meta.get("remaining_by_resource") or {}).items():
+        name = str(resource_name or "").strip()
+        if not name:
+            continue
+        names = files_by_resource.setdefault(name, [])
+        for value in file_names or []:
+            file_name = str(value or "").strip()
+            if file_name and file_name not in names:
+                names.append(file_name)
+    for item in payload.get("dump_resources") or []:
+        if not isinstance(item, dict):
+            continue
+        resource_name = str(item.get("name") or "").strip()
+        if not resource_name:
+            continue
+        names = files_by_resource.setdefault(resource_name, [])
+        for failure in item.get("failed_downloads") or []:
+            if isinstance(failure, dict):
+                file_name = str(failure.get("file") or "").strip()
+                if file_name and file_name not in names:
+                    names.append(file_name)
+        for pending in item.get("retry_pending_files") or []:
+            file_name = str(pending or "").strip()
+            if file_name and file_name not in names:
+                names.append(file_name)
+
+    files_by_resource = {name: files for name, files in files_by_resource.items() if files}
+    if not files_by_resource:
+        raise RuntimeError("该报告没有可补充下载的失败文件。")
+
+    fxap_state = {}
+    for item in (payload.get("decrypt_resources") or []) + (payload.get("raw_resources") or []):
+        if isinstance(item, dict) and item.get("name"):
+            fxap_state[str(item["name"])] = bool(item.get("is_fxap"))
+
+    scope = payload.get("scope") or {}
+    raw_mode = bool(scope.get("rawResourcePreservation")) or scope.get("fxapDecrypt") is False
+    return {
+        "source_report": str(path),
+        "target": target,
+        "output": str(Path(output).expanduser().resolve()),
+        "raw_mode": raw_mode,
+        "files_by_resource": files_by_resource,
+        "resource_is_fxap": fxap_state,
+        "requested_files": sum(len(files) for files in files_by_resource.values()),
+    }
+
+
 def print_warning(message):
     print_external_line("[警告] ", message)
 
@@ -769,7 +837,18 @@ def get_ip_from_cfx(target):
 
 
 class FiveMDumper:
-    def __init__(self, base_url, token, max_workers=10, work_guard=None, keep_temp=False, fallback_base_urls=None):
+    def __init__(
+        self,
+        base_url,
+        token,
+        max_workers=10,
+        work_guard=None,
+        keep_temp=False,
+        fallback_base_urls=None,
+        retry_files_by_resource=None,
+        include_decrypt_prerequisites=False,
+        retry_resource_is_fxap=None,
+    ):
         candidates = [base_url] + list(fallback_base_urls or [])
         self.base_urls = []
         for candidate in candidates:
@@ -786,6 +865,20 @@ class FiveMDumper:
         self.max_workers = max_workers
         self.work_guard = work_guard
         self.keep_temp = bool(keep_temp)
+        self.retry_files_by_resource = None
+        if retry_files_by_resource is not None:
+            self.retry_files_by_resource = {
+                str(resource_name): {
+                    str(file_name).replace("\\", "/").casefold(): str(file_name).replace("\\", "/")
+                    for file_name in file_names
+                }
+                for resource_name, file_names in retry_files_by_resource.items()
+            }
+        self.include_decrypt_prerequisites = bool(include_decrypt_prerequisites)
+        self.retry_resource_is_fxap = {
+            str(resource_name): bool(is_fxap)
+            for resource_name, is_fxap in (retry_resource_is_fxap or {}).items()
+        }
         self.summary = {
             "resources_total": 0,
             "resources_selected": 0,
@@ -794,6 +887,10 @@ class FiveMDumper:
             "download_retry_attempts": 0,
             "download_retry_recovered": 0,
             "failed_downloads": 0,
+            "retry_requested_files": 0,
+            "retry_recovered_files": 0,
+            "retry_remaining_files": 0,
+            "retry_prerequisite_files": 0,
             "failed_files": 0,
             "rpf_unpacked": 0,
             "warnings": 0,
@@ -1070,6 +1167,8 @@ class FiveMDumper:
         res_name = safe_name(resource_name)
         if self.work_guard:
             self.work_guard.check(force=True)
+        retry_lookup = None if self.retry_files_by_resource is None else self.retry_files_by_resource.get(resource_name, {})
+        retry_mode = retry_lookup is not None
         item = {
             "name": resource_name,
             "safe_name": res_name,
@@ -1080,6 +1179,12 @@ class FiveMDumper:
             "download_retry_attempts": 0,
             "download_retry_recovered": 0,
             "failed_downloads": [],
+            "retry_mode": retry_mode,
+            "retry_requested_files": list(retry_lookup.values()) if retry_mode else [],
+            "retry_recovered_files": [],
+            "retry_pending_files": [],
+            "retry_prerequisite_files": [],
+            "retry_prerequisite_failed": False,
             "failed_files": 0,
             "rpf_unpacked": 0,
             "warnings": [],
@@ -1093,6 +1198,10 @@ class FiveMDumper:
             hmac_key = self.xor_bytes(xored_key)[:32]
         except Exception as exc:
             self.error(item, f"资源 {resource_name} 的 URI 解析失败: {exc}")
+            if retry_mode:
+                item["retry_pending_files"] = list(retry_lookup.values())
+                self.summary["retry_requested_files"] += len(retry_lookup)
+                self.summary["retry_remaining_files"] += len(retry_lookup)
             item["status"] = "failed"
             self.resource_reports.append(item)
             return item
@@ -1103,14 +1212,38 @@ class FiveMDumper:
 
         files = res.get("files") or {}
         stream_files = res.get("streamFiles") or {}
-        item["files_total"] = len(files) + len(stream_files)
+        available_retry_names = set()
+
+        def classify_retry_file(file_name, regular_file):
+            normalized = str(file_name).replace("\\", "/").casefold()
+            if retry_mode:
+                available_retry_names.add(normalized)
+            requested = bool(retry_mode and normalized in retry_lookup)
+            decrypt_context = bool(
+                retry_mode
+                and self.include_decrypt_prerequisites
+                and self.retry_resource_is_fxap.get(resource_name) is not False
+                and regular_file
+                and (normalized.endswith(".rpf") or normalized == ".fxap")
+            )
+            prerequisite = bool(decrypt_context and not requested)
+            return requested, prerequisite, decrypt_context
 
         for fname, file_data in files.items():
+            retry_requested, retry_prerequisite, decrypt_context = classify_retry_file(fname, True)
+            if retry_mode and not retry_requested and not retry_prerequisite:
+                continue
+            if retry_prerequisite:
+                item["retry_prerequisite_files"].append(fname)
             hsh = get_file_hash(file_data)
             if not hsh:
                 detail = {"file": fname, "attempts": 0, "status_code": None, "error": "文件缺少 hash，无法下载"}
                 item["failed_downloads"].append(detail)
                 item["failed_files"] += 1
+                if retry_requested:
+                    self.summary["retry_remaining_files"] += 1
+                if decrypt_context:
+                    item["retry_prerequisite_failed"] = True
                 self.summary["failed_downloads"] += 1
                 self.summary["failed_files"] += 1
                 self.warn(item, f"[下载最终失败] {resource_name}/{fname}：文件缺少 hash，无法下载。")
@@ -1119,14 +1252,19 @@ class FiveMDumper:
             url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
             rpf_key = hmac.new(hmac_key, fname.encode(), hashlib.sha256).digest()
             out_path = os.path.join(temp_dir if fname.endswith(".rpf") else unpacked_dir, fname)
-            file_jobs.append((fname, url, rpf_key, iv, out_path))
+            file_jobs.append((fname, url, rpf_key, iv, out_path, retry_requested, retry_prerequisite, decrypt_context))
 
         for fname, body in stream_files.items():
+            retry_requested, retry_prerequisite, decrypt_context = classify_retry_file(fname, False)
+            if retry_mode and not retry_requested:
+                continue
             hsh = get_file_hash(body)
             if not hsh:
                 detail = {"file": fname, "attempts": 0, "status_code": None, "error": "stream 文件缺少 hash，无法下载"}
                 item["failed_downloads"].append(detail)
                 item["failed_files"] += 1
+                if retry_requested:
+                    self.summary["retry_remaining_files"] += 1
                 self.summary["failed_downloads"] += 1
                 self.summary["failed_files"] += 1
                 self.warn(item, f"[下载最终失败] {resource_name}/{fname}：stream 文件缺少 hash，无法下载。")
@@ -1135,18 +1273,53 @@ class FiveMDumper:
             url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
             s_key = hmac.new(hmac_key, fname.encode(), hashlib.sha256).digest()
             out_path = os.path.join(unpacked_dir, "stream", fname)
-            file_jobs.append((fname, url, s_key, iv, out_path))
+            file_jobs.append((fname, url, s_key, iv, out_path, retry_requested, False, False))
+
+        if retry_mode:
+            missing_from_server = [
+                original_name
+                for normalized, original_name in retry_lookup.items()
+                if normalized not in available_retry_names
+            ]
+            for fname in missing_from_server:
+                detail = {
+                    "file": fname,
+                    "attempts": 0,
+                    "status_code": None,
+                    "error": "当前服务器配置中已不存在该文件",
+                }
+                item["failed_downloads"].append(detail)
+                item["failed_files"] += 1
+                self.summary["retry_remaining_files"] += 1
+                self.summary["failed_downloads"] += 1
+                self.summary["failed_files"] += 1
+                self.warn(item, f"[补充下载失败] {resource_name}/{fname}：当前服务器配置中已不存在该文件。")
+            item["files_total"] = len(retry_lookup) + len(item["retry_prerequisite_files"])
+            self.summary["retry_requested_files"] += len(retry_lookup)
+            self.summary["retry_prerequisite_files"] += len(item["retry_prerequisite_files"])
+            print(
+                f"[补充下载] {resource_name}：失败文件 {len(retry_lookup)} 个，"
+                f"解密前置文件 {len(item['retry_prerequisite_files'])} 个。"
+            )
+        else:
+            item["files_total"] = len(files) + len(stream_files)
         print(f"[Dump] ({index}/{total}) 正在下载资源: {resource_name}，文件 {len(file_jobs)} 个。")
         rpf_files = []
         completed = 0
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as exe:
             future_map = {
-                exe.submit(self.download_and_decrypt, url, key, iv_value, out_path, fname, resource_name): (fname, out_path)
-                for fname, url, key, iv_value, out_path in file_jobs
+                exe.submit(self.download_and_decrypt, url, key, iv_value, out_path, fname, resource_name): (
+                    fname,
+                    out_path,
+                    retry_requested,
+                    retry_prerequisite,
+                    decrypt_context,
+                )
+                for fname, url, key, iv_value, out_path, retry_requested, retry_prerequisite, decrypt_context in file_jobs
             }
             for future in as_completed(future_map):
-                fname, out_path = future_map[future]
+                fname, out_path, retry_requested, retry_prerequisite, decrypt_context = future_map[future]
                 completed += 1
                 try:
                     result = future.result()
@@ -1175,6 +1348,9 @@ class FiveMDumper:
                 if result.get("path"):
                     item["downloaded_files"] += 1
                     self.summary["downloaded_files"] += 1
+                    if retry_requested:
+                        item["retry_recovered_files"].append(fname)
+                        self.summary["retry_recovered_files"] += 1
                     if retries > 0:
                         item["download_retry_recovered"] += 1
                         self.summary["download_retry_recovered"] += 1
@@ -1182,10 +1358,14 @@ class FiveMDumper:
                     else:
                         print(f"[下载完成] {fname}")
                     if fname.endswith(".rpf"):
-                        rpf_files.append(result["path"])
+                        rpf_files.append((result["path"], fname, retry_requested, retry_prerequisite, decrypt_context))
                 else:
                     item["failed_files"] += 1
                     self.summary["failed_files"] += 1
+                    if retry_requested:
+                        self.summary["retry_remaining_files"] += 1
+                    if decrypt_context:
+                        item["retry_prerequisite_failed"] = True
                     if result.get("failure_stage") == "download":
                         detail = {
                             "file": fname,
@@ -1208,11 +1388,15 @@ class FiveMDumper:
                 resource_ratio = ((index - 1) + (completed / max(1, len(file_jobs)))) / max(1, total)
                 emit_progress(base + int(span * resource_ratio), "dump", f"正在 Dump {resource_name}: {completed}/{len(file_jobs)}")
 
-        for rpf_path in rpf_files:
+        for rpf_path, rpf_name, retry_requested, retry_prerequisite, decrypt_context in rpf_files:
             if os.path.exists(rpf_path):
-                self.unpack_rpf(rpf_path, unpacked_dir, item)
+                unpacked = self.unpack_rpf(rpf_path, unpacked_dir, item)
+                if retry_mode and self.include_decrypt_prerequisites and not unpacked:
+                    item["retry_prerequisite_failed"] = True
             else:
                 self.warn(item, f"RPF 文件不存在，已跳过: {rpf_path}")
+                if retry_mode and self.include_decrypt_prerequisites:
+                    item["retry_prerequisite_failed"] = True
 
         if item["failed_files"] == 0:
             item["status"] = "success"
@@ -2058,6 +2242,28 @@ class FiveMDecryptor:
         self.resource_reports.append(item)
         return item
 
+    def record_retry_prerequisite_failure(self, resource_name, message, is_fxap=True):
+        self.summary["resources_total"] += 1
+        self.summary["errors"] += 1
+        item = {
+            "name": resource_name,
+            "status": "failed",
+            "is_fxap": bool(is_fxap),
+            "raw_preserved": False,
+            "output_dir": str((Path(self.OutputDir) / resource_name).resolve()),
+            "resource_id": "",
+            "files_total": 0,
+            "decrypted_files": 0,
+            "copied_files": 0,
+            "failed_files": 1,
+            "warnings": [],
+            "errors": [str(message)],
+        }
+        self.summary["failed_files"] += 1
+        self.resource_reports.append(item)
+        print_error(message)
+        return item
+
     def decrypt_resource(self, resource_path, resource_name, grants_token=None):
         self.summary["resources_total"] += 1
         if self.OutputGuard:
@@ -2257,6 +2463,7 @@ def parse_args(argv):
     parser.add_argument("--token", default="", help="手动 token；token-choice=2 时使用，也可作为自动扫描失败后的备用 token")
     parser.add_argument("--resources", default=None, help="资源选择：支持 all、序号、精确名称和 *、? 通配符，多个条件用逗号分隔；非交互模式默认 all")
     parser.add_argument("--resources-file", default="", help="包含精确资源名数组的 JSON 文件")
+    parser.add_argument("--retry-failed-report", default="", help="读取上一次 server-dump JSON 报告，只补充下载其中失败或待处理的文件并合并回原输出目录")
     parser.add_argument("--list-resources", action="store_true", help="仅获取并输出服务器资源清单，不执行 Dump")
     parser.add_argument("--output", default="Output", help="Dump 处理输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
@@ -2354,6 +2561,15 @@ def build_markdown_report(report):
         f"- 警告: {summary.get('warnings', 0)}",
         f"- 错误: {summary.get('errors', 0)}",
         "",
+        "## 补充失败下载",
+        "",
+        f"- 启用: {'是' if report.get('retry_failed', {}).get('enabled') else '否'}",
+        f"- 来源报告: {report.get('retry_failed', {}).get('source_report', '')}",
+        f"- 请求补充文件: {report.get('retry_failed', {}).get('requested_files', 0)}",
+        f"- 本次下载成功: {report.get('retry_failed', {}).get('recovered_files', 0)}",
+        f"- 仍需补充: {report.get('retry_failed', {}).get('remaining_files', 0)}",
+        f"- 额外解密前置文件: {report.get('retry_failed', {}).get('prerequisite_files', 0)}",
+        "",
         "## 顶点修复",
         "",
         f"- 启用: {'是' if report.get('vertex_fix', {}).get('enabled') else '否'}",
@@ -2381,6 +2597,13 @@ def build_markdown_report(report):
                 f"最终未下载 {len(item.get('failed_downloads', []))}，"
                 f"RPF 解包 {item.get('rpf_unpacked', 0)}"
             )
+            if item.get("retry_mode"):
+                lines.append(
+                    f"  - 补充请求 {len(item.get('retry_requested_files', []))}，"
+                    f"本次下载成功 {len(item.get('retry_recovered_files', []))}，"
+                    f"待下次继续 {len(item.get('retry_pending_files', []))}，"
+                    f"额外前置文件 {len(item.get('retry_prerequisite_files', []))}"
+                )
             for warning in item.get("warnings", [])[:5]:
                 lines.append(f"  - 警告: {warning}")
             for error in item.get("errors", [])[:5]:
@@ -2401,6 +2624,16 @@ def build_markdown_report(report):
             )
     if failed_download_count == 0:
         lines.append("- 无")
+
+    if report.get("retry_failed", {}).get("enabled"):
+        lines.extend(["", "## 下一轮仍需补充", ""])
+        remaining_by_resource = report.get("retry_failed", {}).get("remaining_by_resource", {}) or {}
+        if remaining_by_resource:
+            for resource_name, file_names in remaining_by_resource.items():
+                for file_name in file_names:
+                    lines.append(f"- {resource_name}/{file_name}")
+        else:
+            lines.append("- 无")
 
     lines.extend(["", "## FXAP 解密资源", ""])
     decrypt_resources = report.get("decrypt_resources", [])
@@ -2553,6 +2786,23 @@ def run_tool(args):
     os.chdir(SCRIPT_DIR)
     start_time = time.time()
     started_at = now_iso()
+    retry_plan = None
+    retry_plan_error = ""
+    if args.retry_failed_report:
+        try:
+            retry_plan = load_failed_download_retry_report(args.retry_failed_report)
+            supplied_target = str(args.target or "").strip().rstrip("/")
+            report_target = retry_plan["target"].strip().rstrip("/")
+            if supplied_target and supplied_target.casefold() != report_target.casefold():
+                raise RuntimeError("补充下载报告的目标服务器与命令行目标不一致。")
+            args.target = retry_plan["target"]
+            args.output = retry_plan["output"]
+            args.resources = None
+            args.resources_file = ""
+            args.no_fxap_decrypt = bool(retry_plan["raw_mode"])
+            args.vertex_fix = False
+        except Exception as exc:
+            retry_plan_error = str(exc)
     decrypt_enabled = not bool(args.no_fxap_decrypt)
 
     output_dir = Path(args.output)
@@ -2579,7 +2829,7 @@ def run_tool(args):
         "base_url": "",
         "output": str(output_dir),
         "token_choice": args.token_choice,
-        "resources_requested": args.resources_file or args.resources or ("all" if args.non_interactive else ""),
+        "resources_requested": list(retry_plan["files_by_resource"].keys()) if retry_plan else (args.resources_file or args.resources or ("all" if args.non_interactive else "")),
         "java": {
             "ok": False,
             "required": decrypt_enabled,
@@ -2624,6 +2874,16 @@ def run_tool(args):
         "dump_resources": [],
         "decrypt_resources": [],
         "raw_resources": [],
+        "retry_failed": {
+            "enabled": bool(args.retry_failed_report),
+            "source_report": retry_plan["source_report"] if retry_plan else str(args.retry_failed_report or ""),
+            "requested_files": int(retry_plan["requested_files"]) if retry_plan else 0,
+            "requested_by_resource": retry_plan["files_by_resource"] if retry_plan else {},
+            "recovered_files": 0,
+            "remaining_files": 0,
+            "remaining_by_resource": {},
+            "prerequisite_files": 0,
+        },
         "warnings": [],
         "errors": [],
     }
@@ -2658,6 +2918,10 @@ def run_tool(args):
             "download_retry_attempts": int(dump_summary.get("download_retry_attempts", 0)),
             "download_retry_recovered": int(dump_summary.get("download_retry_recovered", 0)),
             "failed_downloads": int(dump_summary.get("failed_downloads", 0)),
+            "retry_requested_files": int(dump_summary.get("retry_requested_files", 0)),
+            "retry_recovered_files": int(dump_summary.get("retry_recovered_files", 0)),
+            "retry_remaining_files": int(dump_summary.get("retry_remaining_files", 0)),
+            "retry_prerequisite_files": int(dump_summary.get("retry_prerequisite_files", 0)),
             "rpf_unpacked": int(dump_summary.get("rpf_unpacked", 0)),
             "resources_decrypted": int(decrypt_summary.get("resources_decrypted", 0)),
             "resources_copied": int(decrypt_summary.get("resources_copied", 0)),
@@ -2672,8 +2936,40 @@ def run_tool(args):
             "vertex_fix_repaired_files": int((report.get("vertex_fix") or {}).get("repaired_files", 0)),
             "vertex_fix_failed_files": int((report.get("vertex_fix") or {}).get("failed_files", 0)),
         }
+        report["retry_failed"]["recovered_files"] = int(dump_summary.get("retry_recovered_files", 0))
+        report["retry_failed"]["remaining_files"] = int(dump_summary.get("retry_remaining_files", 0))
+        report["retry_failed"]["prerequisite_files"] = int(dump_summary.get("retry_prerequisite_files", 0))
+        if retry_plan:
+            items_by_name = {
+                str(item.get("name") or ""): item
+                for item in report.get("dump_resources", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            remaining_by_resource = {}
+            for resource_name, requested_files in retry_plan["files_by_resource"].items():
+                item = items_by_name.get(resource_name)
+                remaining = []
+                if item is None:
+                    remaining.extend(requested_files)
+                else:
+                    for failure in item.get("failed_downloads", []):
+                        file_name = str(failure.get("file") or "").strip() if isinstance(failure, dict) else ""
+                        if file_name and file_name not in remaining:
+                            remaining.append(file_name)
+                    for pending in item.get("retry_pending_files", []):
+                        file_name = str(pending or "").strip()
+                        if file_name and file_name not in remaining:
+                            remaining.append(file_name)
+                if remaining:
+                    remaining_by_resource[resource_name] = remaining
+            remaining_count = sum(len(files) for files in remaining_by_resource.values())
+            report["retry_failed"]["remaining_by_resource"] = remaining_by_resource
+            report["retry_failed"]["remaining_files"] = remaining_count
+            report["summary"]["retry_remaining_files"] = remaining_count
 
     try:
+        if retry_plan_error:
+            raise RuntimeError(retry_plan_error)
         if args.vertex_fix and not decrypt_enabled:
             raise RuntimeError("顶点修复依赖 FXAP 解密；选择不解密时不能同时启用顶点修复。")
         os.chdir(work_dir)
@@ -2731,10 +3027,15 @@ def run_tool(args):
             raise RuntimeError("缺少目标地址，请输入 cfx.re 链接或 IP:端口。")
         report["target"] = target
 
-        resources_choice = load_resource_selection_file(args.resources_file) if args.resources_file else args.resources
-        if args.non_interactive and not resources_choice:
+        resources_choice = list(retry_plan["files_by_resource"].keys()) if retry_plan else (load_resource_selection_file(args.resources_file) if args.resources_file else args.resources)
+        if args.non_interactive and not resources_choice and not retry_plan:
             resources_choice = "all"
         report["resources_requested"] = resources_choice or ""
+        if retry_plan:
+            print(
+                f"[补充下载] 来源报告: {retry_plan['source_report']}；"
+                f"资源 {len(retry_plan['files_by_resource'])} 个，失败文件 {retry_plan['requested_files']} 个。"
+            )
 
         token = choose_token(args)
 
@@ -2760,20 +3061,48 @@ def run_tool(args):
             work_guard=work_guard,
             keep_temp=args.keep_temp,
             fallback_base_urls=endpoint["base_urls"][1:],
+            retry_files_by_resource=retry_plan["files_by_resource"] if retry_plan else None,
+            include_decrypt_prerequisites=bool(retry_plan and decrypt_enabled),
+            retry_resource_is_fxap=retry_plan["resource_is_fxap"] if retry_plan else None,
         )
 
         def process_ready_resource(resource_path, resource_name, dump_item):
             if decrypt_enabled:
+                if retry_plan:
+                    prior_fxap_state = retry_plan["resource_is_fxap"].get(resource_name)
+                    has_fxap = os.path.isfile(os.path.join(resource_path, ".fxap"))
+                    prerequisite_uncertain = prior_fxap_state is None and dump_item.get("retry_prerequisite_failed")
+                    if not has_fxap and (prior_fxap_state is True or prerequisite_uncertain):
+                        failed_names = {
+                            str(failure.get("file") or "").replace("\\", "/").casefold()
+                            for failure in dump_item.get("failed_downloads", [])
+                        }
+                        pending = []
+                        for file_name in dump_item.get("retry_requested_files", []):
+                            normalized = str(file_name).replace("\\", "/").casefold()
+                            if normalized not in failed_names and file_name not in pending:
+                                pending.append(file_name)
+                        dump_item["retry_pending_files"] = pending
+                        dumper.summary["retry_remaining_files"] += len(pending)
+                        message = (
+                            f"补充下载未获得 {resource_name} 的 .fxap 解密上下文；"
+                            f"已下载的 {len(pending)} 个文件暂未写入解密输出，下次补充会继续处理。"
+                        )
+                        decryptor.record_retry_prerequisite_failure(resource_name, message, is_fxap=True)
+                        return
                 print(f"[流水线] Dump 完成，立即处理 FXAP 并释放临时文件: {resource_name}")
                 decryptor.decrypt_resource(resource_path, resource_name)
             else:
                 print(f"[流水线] Dump 完成，立即完整复制原始资源（含 .fxap）并释放临时文件: {resource_name}")
-                decryptor.preserve_raw_resource(
+                raw_item = decryptor.preserve_raw_resource(
                     resource_path,
                     resource_name,
                     source_complete=int(dump_item.get("failed_files", 0) or 0) == 0,
                     source_failed_files=int(dump_item.get("failed_files", 0) or 0),
                 )
+                if retry_plan and raw_item.get("status") == "raw_preserved":
+                    raw_item["status"] = "raw_supplemented"
+                    raw_item["retry_supplement"] = True
 
         dumper.run(resources_choice, on_resource_ready=process_ready_resource)
         report["base_url"] = dumper.base_url

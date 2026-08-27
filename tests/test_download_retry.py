@@ -191,6 +191,69 @@ class DownloadRetryTests(unittest.TestCase):
         self.assertIn("example_resource/no-hash.lua", markdown)
         self.assertIn("example_resource/missing.lua: HTTP 404，尝试 4 次", markdown)
 
+    def test_supplement_download_only_schedules_failures_and_decrypt_prerequisite(self):
+        dumper = auto.FiveMDumper(
+            "https://127.0.0.1:30120",
+            "test-token",
+            retry_files_by_resource={"example_resource": ["failed.lua", "failed.ydr"]},
+            include_decrypt_prerequisites=True,
+            retry_resource_is_fxap={"example_resource": True},
+        )
+        raw_uri = bytes(range(61))
+        resource = {
+            "name": "example_resource",
+            "uri": "test#" + base64.b64encode(raw_uri).decode("ascii"),
+            "files": {
+                "resource.rpf": {"hash": "rpf-hash"},
+                "failed.lua": {"hash": "failed-lua-hash"},
+                "already-ok.lua": {"hash": "ok-lua-hash"},
+            },
+            "streamFiles": {
+                "failed.ydr": {"hash": "failed-stream-hash"},
+                "already-ok.ydr": {"hash": "ok-stream-hash"},
+            },
+        }
+        scheduled = []
+
+        def fake_download(_url, _key, _iv, out_path, file_name, _resource_name):
+            scheduled.append(file_name)
+            path = Path(out_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"downloaded")
+            return {
+                "path": str(path),
+                "file": file_name,
+                "bytes": 10,
+                "attempts": 1,
+                "retries": 0,
+                "status_code": 200,
+                "failure_stage": "",
+                "error": "",
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                with mock.patch.object(dumper, "download_and_decrypt", side_effect=fake_download), mock.patch.object(
+                    dumper,
+                    "unpack_rpf",
+                    return_value=True,
+                ):
+                    item = dumper.fetch_resource(resource, 1, 1)
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(set(scheduled), {"resource.rpf", "failed.lua", "failed.ydr"})
+        self.assertNotIn("already-ok.lua", scheduled)
+        self.assertNotIn("already-ok.ydr", scheduled)
+        self.assertEqual(item["retry_requested_files"], ["failed.lua", "failed.ydr"])
+        self.assertEqual(item["retry_prerequisite_files"], ["resource.rpf"])
+        self.assertEqual(set(item["retry_recovered_files"]), {"failed.lua", "failed.ydr"})
+        self.assertEqual(dumper.summary["retry_requested_files"], 2)
+        self.assertEqual(dumper.summary["retry_recovered_files"], 2)
+        self.assertEqual(dumper.summary["retry_prerequisite_files"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
