@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.11"
+TOOL_VERSION = "1.1.12"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -879,6 +879,7 @@ class FiveMDumper:
             str(resource_name): bool(is_fxap)
             for resource_name, is_fxap in (retry_resource_is_fxap or {}).items()
         }
+        self.unmatched_retry_resources = []
         self.summary = {
             "resources_total": 0,
             "resources_selected": 0,
@@ -1425,8 +1426,10 @@ class FiveMDumper:
         if isinstance(choice, (list, tuple, set)):
             selected, unmatched = resolve_resource_selection(resources, choice)
             if unmatched:
-                detail = ", ".join(unmatched[:20])
-                raise RuntimeError(f"Confirmed resources are no longer available: {detail}")
+                if self.retry_files_by_resource is None:
+                    detail = ", ".join(unmatched[:20])
+                    raise RuntimeError(f"Confirmed resources are no longer available: {detail}")
+                self.unmatched_retry_resources = list(unmatched)
             self.print_resource_selection(selected)
             return selected
 
@@ -1479,7 +1482,45 @@ class FiveMDumper:
         chosen = self.select_resources(resources, resources_choice)
         self.summary["resources_selected"] = len(chosen)
 
+        if self.retry_files_by_resource is not None and self.unmatched_retry_resources:
+            unavailable_names = self.unmatched_retry_resources
+            self.summary["warnings"] += 1
+            preview = ", ".join(unavailable_names[:20])
+            suffix = f"，另有 {len(unavailable_names) - 20} 个" if len(unavailable_names) > 20 else ""
+            print_warning(
+                f"[补充下载] 当前服务器缺少 {len(unavailable_names)} 个旧报告资源，"
+                f"已保留到下一轮，其他资源继续处理: {preview}{suffix}"
+            )
+            for resource_name in unavailable_names:
+                retry_lookup = self.retry_files_by_resource.get(resource_name, {})
+                requested_files = list(retry_lookup.values())
+                self.summary["retry_requested_files"] += len(requested_files)
+                self.summary["retry_remaining_files"] += len(requested_files)
+                self.resource_reports.append({
+                    "name": resource_name,
+                    "safe_name": safe_name(resource_name),
+                    "status": "unavailable",
+                    "files_total": len(requested_files),
+                    "downloaded_files": 0,
+                    "download_retried_files": 0,
+                    "download_retry_attempts": 0,
+                    "download_retry_recovered": 0,
+                    "failed_downloads": [],
+                    "retry_mode": True,
+                    "retry_requested_files": requested_files,
+                    "retry_recovered_files": [],
+                    "retry_pending_files": requested_files,
+                    "retry_prerequisite_files": [],
+                    "retry_prerequisite_failed": False,
+                    "failed_files": 0,
+                    "rpf_unpacked": 0,
+                    "warnings": ["当前服务器资源清单中不存在该资源，已保留到下一轮补充。"],
+                    "errors": [],
+                })
+
         if not chosen:
+            if self.retry_files_by_resource is not None:
+                return self.resource_reports
             raise RuntimeError("No resources matched the requested selection")
 
         print(f"[Dump] 将处理 {len(chosen)} 个资源，并在每个资源完成后立即执行所选处理和释放临时文件。")

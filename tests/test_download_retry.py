@@ -254,6 +254,51 @@ class DownloadRetryTests(unittest.TestCase):
         self.assertEqual(dumper.summary["retry_recovered_files"], 2)
         self.assertEqual(dumper.summary["retry_prerequisite_files"], 1)
 
+    def test_unavailable_old_resource_does_not_abort_other_supplements(self):
+        dumper = auto.FiveMDumper(
+            "https://127.0.0.1:30120",
+            "test-token",
+            retry_files_by_resource={
+                "available_resource": ["missing.lua"],
+                "removed_resource": ["old.ydr", "old.ytd"],
+            },
+        )
+        fetched = []
+
+        def fake_fetch(resource, _index, _total):
+            fetched.append(resource["name"])
+            dumper.summary["retry_requested_files"] += 1
+            dumper.summary["retry_recovered_files"] += 1
+            item = {
+                "name": resource["name"],
+                "status": "success",
+                "retry_mode": True,
+                "retry_requested_files": ["missing.lua"],
+                "retry_recovered_files": ["missing.lua"],
+                "retry_pending_files": [],
+                "retry_prerequisite_files": [],
+                "failed_downloads": [],
+                "warnings": [],
+                "errors": [],
+            }
+            dumper.resource_reports.append(item)
+            return item
+
+        with mock.patch.object(
+            dumper,
+            "get_configuration",
+            return_value=[{"name": "available_resource"}],
+        ), mock.patch.object(dumper, "fetch_resource", side_effect=fake_fetch):
+            result = dumper.run(["available_resource", "removed_resource"])
+
+        self.assertEqual(fetched, ["available_resource"])
+        removed = next(item for item in result if item["name"] == "removed_resource")
+        self.assertEqual(removed["status"], "unavailable")
+        self.assertEqual(removed["retry_pending_files"], ["old.ydr", "old.ytd"])
+        self.assertEqual(dumper.summary["retry_requested_files"], 3)
+        self.assertEqual(dumper.summary["retry_remaining_files"], 2)
+        self.assertEqual(dumper.summary["warnings"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
