@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.16"
+TOOL_VERSION = "1.1.17"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -47,10 +47,6 @@ DOWNLOAD_RETRY_AFTER_MAX_SECONDS = 30.0
 DOWNLOAD_RETRY_STATUS_CODES = {403, 404, 408, 409, 425, 429, 500, 502, 503, 504}
 VERTEX_FIXER_CLI = SCRIPT_DIR / "FIXER" / "FivemDecryptFixer.Cli.exe"
 VERTEX_FIX_EXTENSIONS = {".ydr", ".yft", ".ydd"}
-VERTEX_FIX_DISCLAIMER = (
-    "顶点修复不等于模型修复，不一定能 100% 修复模型，也不保证修复后的模型可以被 FiveM 加载。"
-    "如需修复模型，可以进群找群主免费修复。"
-)
 GRANTS_CLK_DERIVE_URL = "https://grantsclk.ckcloud.de5.net/v1/derive"
 GRANTS_CLK_REQUESTS_PER_MINUTE = 45
 GRANTS_CLK_MIN_INTERVAL_SECONDS = 60.0 / GRANTS_CLK_REQUESTS_PER_MINUTE
@@ -153,7 +149,7 @@ def directory_size(path):
 
 def create_vertex_fix_output_dir(output_dir):
     output_dir = Path(output_dir).resolve()
-    base = output_dir.parent / f"{output_dir.name}_顶点修复"
+    base = output_dir.parent / f"{output_dir.name}_模型修复"
     if not base.exists():
         return base
 
@@ -165,7 +161,7 @@ def create_vertex_fix_output_dir(output_dir):
         candidate = base.parent / candidate_name
         if not candidate.exists():
             return candidate
-    raise RuntimeError("无法创建唯一的顶点修复输出目录。")
+    raise RuntimeError("无法创建唯一的模型修复输出目录。")
 
 
 def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
@@ -181,7 +177,7 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
         "failed_files": 0,
         "exit_code": None,
         "warnings": [],
-        "disclaimer": VERTEX_FIX_DISCLAIMER,
+        "disclaimer": "",
     }
 
     eligible = []
@@ -195,11 +191,11 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
     result["resources_eligible"] = len(eligible)
     if not eligible:
         result["status"] = "skipped"
-        print("[顶点修复] 本次没有已解密的 FXAP 资源，已跳过顶点修复。")
+        print("[模型修复] 本次没有已解密的 FXAP 资源，已跳过模型修复。")
         return result
 
     if not VERTEX_FIXER_CLI.is_file():
-        raise RuntimeError(f"缺少顶点修复命令行工具: {VERTEX_FIXER_CLI}")
+        raise RuntimeError(f"缺少模型修复命令行工具: {VERTEX_FIXER_CLI}")
 
     fixed_root = create_vertex_fix_output_dir(output_dir)
     model_bytes = 0
@@ -216,16 +212,16 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
 
     fixed_root.mkdir(parents=True, exist_ok=False)
     result["output"] = str(fixed_root)
-    print(f"[顶点修复] 原解密目录保持不变: {Path(output_dir).resolve()}")
-    print(f"[顶点修复] 正在复制 {len(eligible)} 个 FXAP 资源的完整目录到: {fixed_root}")
+    print(f"[模型修复] 原解密目录保持不变: {Path(output_dir).resolve()}")
+    print(f"[模型修复] 正在复制 {len(eligible)} 个 FXAP 资源的完整目录到: {fixed_root}")
 
     for index, (item, source) in enumerate(eligible, start=1):
         destination = fixed_root / source.name
         if destination.exists():
-            raise RuntimeError(f"顶点修复副本目录冲突: {destination}")
+            raise RuntimeError(f"模型修复副本目录冲突: {destination}")
         shutil.copytree(source, destination)
         result["resources_copied"] += 1
-        print(f"[顶点修复] 已复制完整资源 {index}/{len(eligible)}: {item.get('name', source.name)}")
+        print(f"[模型修复] 已复制完整资源 {index}/{len(eligible)}: {item.get('name', source.name)}")
 
     work_root = Path(tempfile.mkdtemp(prefix=".ck_vertex_fix_work-", dir=str(fixed_root.parent)))
     model_file_count = 0
@@ -241,8 +237,7 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
                 shutil.copy2(model_path, work_path)
                 model_file_count += 1
 
-        print(f"[顶点修复] 已隔离 {model_file_count} 个 .ydr/.yft/.ydd 文件；其他文件不会交给修复器。")
-        print(f"[顶点修复提示] {VERTEX_FIX_DISCLAIMER}")
+        print(f"[模型修复] 已隔离 {model_file_count} 个 .ydr/.yft/.ydd 文件；其他文件不会交给修复器。")
         proc = subprocess.run(
             [str(VERTEX_FIXER_CLI), "fix-models", str(work_root)],
             cwd=str(VERTEX_FIXER_CLI.parent),
@@ -266,7 +261,7 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
         for line in (text or "").splitlines():
             if line.strip():
                 combined_lines.append(line.rstrip())
-                print_external_line("[顶点修复] ", line.rstrip())
+                print_external_line("[模型修复] ", line.rstrip())
 
     summary_pattern = re.compile(r"\[MODEL\]\s+scanned=(\d+),\s*repaired=(\d+),\s*failed=(\d+)")
     for line in reversed(combined_lines):
@@ -282,13 +277,13 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
     elif result["repaired_files"] > 0 or result["resources_copied"] > 0:
         result["status"] = "partial"
         result["warnings"].append(
-            f"顶点修复部分失败：扫描 {result['scanned_files']}，成功处理 {result['repaired_files']}，"
+            f"模型修复部分失败：扫描 {result['scanned_files']}，成功处理 {result['repaired_files']}，"
             f"失败 {result['failed_files']}，退出码 {proc.returncode}。"
         )
     else:
         result["status"] = "failed"
         detail = next((line for line in reversed(combined_lines) if "ERROR" in line or "FATAL" in line), "")
-        result["warnings"].append(detail or f"顶点修复工具退出码: {proc.returncode}")
+        result["warnings"].append(detail or f"模型修复工具退出码: {proc.returncode}")
 
     return result
 
@@ -2519,7 +2514,7 @@ def parse_args(argv):
     parser.add_argument("--non-interactive", action="store_true", help="非交互模式，缺少必要信息时直接失败")
     parser.add_argument("--keep-temp", action="store_true", help="保留本次运行的临时工作区；默认逐资源处理后清理")
     parser.add_argument("--no-fxap-decrypt", action="store_true", help="不执行 FXAP 解密，将下载、解包后的原始资源（含 .fxap）按完整目录复制到输出")
-    parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行顶点修复")
+    parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行模型修复")
     return parser.parse_args(argv)
 
 
@@ -2568,8 +2563,7 @@ def build_markdown_report(report):
         f"- 服务器 Dump: {'包含' if scope.get('serverDump') else '不包含'}",
         f"- FXAP 解密: {'包含' if scope.get('fxapDecrypt') else '不包含'}",
         f"- 原始 FXAP 资源完整保留: {'包含' if scope.get('rawResourcePreservation') else '不包含'}",
-        f"- 顶点修复: {'包含（可选）' if scope.get('vertexFix') else '不包含'}",
-        f"- 模型修复: {'包含' if scope.get('modelRepair') else '不包含'}",
+        f"- 模型修复: {'包含（可选）' if scope.get('modelRepair') or scope.get('vertexFix') else '不包含'}",
         "",
         "## 存储与临时目录",
         "",
@@ -2616,7 +2610,7 @@ def build_markdown_report(report):
         f"- 仍需补充: {report.get('retry_failed', {}).get('remaining_files', 0)}",
         f"- 额外解密前置文件: {report.get('retry_failed', {}).get('prerequisite_files', 0)}",
         "",
-        "## 顶点修复",
+        "## 模型修复",
         "",
         f"- 启用: {'是' if report.get('vertex_fix', {}).get('enabled') else '否'}",
         f"- 状态: {report.get('vertex_fix', {}).get('status', 'disabled')}",
@@ -2627,7 +2621,6 @@ def build_markdown_report(report):
         f"- 扫描文件: {report.get('vertex_fix', {}).get('scanned_files', 0)}",
         f"- 成功处理: {report.get('vertex_fix', {}).get('repaired_files', 0)}",
         f"- 失败文件: {report.get('vertex_fix', {}).get('failed_files', 0)}",
-        f"- 风险提示: {report.get('vertex_fix', {}).get('disclaimer', VERTEX_FIX_DISCLAIMER)}",
         "",
         "## Dump 资源",
         "",
@@ -2898,7 +2891,7 @@ def run_tool(args):
             "fxapDecrypt": decrypt_enabled,
             "rawResourcePreservation": not decrypt_enabled,
             "vertexFix": bool(args.vertex_fix),
-            "modelRepair": False,
+            "modelRepair": bool(args.vertex_fix),
         },
         "vertex_fix": {
             "enabled": bool(args.vertex_fix),
@@ -2912,7 +2905,7 @@ def run_tool(args):
             "failed_files": 0,
             "exit_code": None,
             "warnings": [],
-            "disclaimer": VERTEX_FIX_DISCLAIMER,
+            "disclaimer": "",
         },
         "summary": {},
         "dump_summary": {},
@@ -3017,7 +3010,7 @@ def run_tool(args):
         if retry_plan_error:
             raise RuntimeError(retry_plan_error)
         if args.vertex_fix and not decrypt_enabled:
-            raise RuntimeError("顶点修复依赖 FXAP 解密；选择不解密时不能同时启用顶点修复。")
+            raise RuntimeError("模型修复依赖 FXAP 解密；选择不解密时不能同时启用模型修复。")
         os.chdir(work_dir)
         output_space = output_guard.check(force=True)
         temp_space = work_guard.check(force=True)
@@ -3031,10 +3024,8 @@ def run_tool(args):
         else:
             feature_text += "、原始 FXAP 资源完整保留（不解密）"
         if args.vertex_fix:
-            feature_text += "、解密后顶点修复副本"
-        print(f"功能范围: {feature_text}；不包含完整模型修复。")
-        if args.vertex_fix:
-            print(f"[顶点修复提示] {VERTEX_FIX_DISCLAIMER}")
+            feature_text += "、解密后模型修复副本"
+        print(f"功能范围: {feature_text}。")
         print(f"[存储] 输出目录: {output_dir}")
         print(f"[存储] 临时工作区: {work_dir}")
         print(
@@ -3161,7 +3152,7 @@ def run_tool(args):
             print("[原始保留] 未执行 FXAP 解密，完整资源目录已复制到输出。")
 
         if args.vertex_fix:
-            emit_progress(90, "vertex_fix", "正在复制已解密的 FXAP 完整资源并执行顶点修复。")
+            emit_progress(90, "vertex_fix", "正在复制已解密的 FXAP 完整资源并执行模型修复。")
             try:
                 report["vertex_fix"] = run_vertex_fix(
                     decryptor.resource_reports,
@@ -3171,13 +3162,13 @@ def run_tool(args):
                 for warning in report["vertex_fix"].get("warnings", []):
                     report["warnings"].append(warning)
                 if report["vertex_fix"].get("status") == "success":
-                    emit_progress(94, "vertex_fix", "顶点修复副本已生成。")
+                    emit_progress(94, "vertex_fix", "模型修复副本已生成。")
                 elif report["vertex_fix"].get("status") == "skipped":
-                    emit_progress(94, "vertex_fix", "没有符合条件的 FXAP 资源，已跳过顶点修复。")
+                    emit_progress(94, "vertex_fix", "没有符合条件的 FXAP 资源，已跳过模型修复。")
                 else:
-                    emit_progress(94, "vertex_fix", "顶点修复副本已生成，但存在失败项，请查看报告。")
+                    emit_progress(94, "vertex_fix", "模型修复副本已生成，但存在失败项，请查看报告。")
             except Exception as exc:
-                message = f"顶点修复阶段失败，原解密输出未受影响: {exc}"
+                message = f"模型修复阶段失败，原解密输出未受影响: {exc}"
                 print_warning(message)
                 report["vertex_fix"]["status"] = "failed"
                 report["vertex_fix"]["warnings"].append(message)

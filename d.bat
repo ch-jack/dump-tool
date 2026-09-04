@@ -8,7 +8,7 @@ echo ========================================
 echo        FiveM 服务器 Dump / FXAP 解密
 echo ========================================
 echo.
-echo 功能范围：包含服务器 Dump、FXAP 解密；不含模型修复。
+echo 功能范围：包含服务器 Dump、FXAP 解密与可选模型修复。
 echo 默认 token 方式：1 - 自动扫描 FiveM 进程。
 echo.
 
