@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.13"
+TOOL_VERSION = "1.1.14"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -419,6 +419,11 @@ def load_resource_selection_file(file_path):
     except Exception as exc:
         raise RuntimeError(f"Unable to read resource selection file {path}: {exc}") from exc
     values = payload.get("resources") if isinstance(payload, dict) else payload
+    # Toolbox versions before the single-selection fix serialized one resource as
+    # a JSON string. Accept that legacy object shape while keeping other invalid
+    # selection-file shapes rejected.
+    if isinstance(payload, dict) and isinstance(values, str):
+        values = [values]
     if not isinstance(values, list):
         raise RuntimeError("Resource selection file must contain a resources array")
     names = [value.strip() for value in values if isinstance(value, str) and value.strip()]
