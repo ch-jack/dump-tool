@@ -73,6 +73,7 @@ jobs:
             'FIXER\FivemDecryptFixer.exe',
             'FIXER\FivemDecryptFixer.dll',
             'FIXER\FivemDecryptFixer.Cli.exe',
+            'FIXER\CK.VertexBridge.dll',
             'FIXER\FivemDecryptFixer.Cli.dll',
             'FIXER\FivemDecryptFixer.Cli.deps.json',
             'FIXER\FivemDecryptFixer.Cli.runtimeconfig.json'
@@ -98,6 +99,12 @@ jobs:
             if (Test-Path -LiteralPath $item) {
               Copy-Item -LiteralPath $item -Destination $stageRoot -Recurse -Force
             }
+          }
+
+          Get-ChildItem -LiteralPath $stageRoot -Recurse -File -Filter '*.pdb' |
+            Remove-Item -Force
+          if (@(Get-ChildItem -LiteralPath $stageRoot -Recurse -File -Filter '*.pdb').Count -ne 0) {
+            throw 'Release package must not contain PDB files.'
           }
 
           $assetPath = Join-Path $PWD $assetName
