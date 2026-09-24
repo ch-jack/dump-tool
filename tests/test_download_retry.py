@@ -191,6 +191,42 @@ class DownloadRetryTests(unittest.TestCase):
         self.assertIn("example_resource/no-hash.lua", markdown)
         self.assertIn("example_resource/missing.lua: HTTP 404，尝试 4 次", markdown)
 
+    def test_resource_urls_preserve_fivem_resource_name(self):
+        for name in (
+            "(MLO)%20IPROMX%20-%20The%20Secret%20Cave",
+            "530d",
+            "(MLO)Cave",
+            "literal%2Fname%25",
+        ):
+            for file_server in (None, "https://cdn.example/files/"):
+                with self.subTest(name=name, file_server=file_server):
+                    dumper = auto.FiveMDumper("https://127.0.0.1:30120", "test-token")
+                    resource = {
+                        "name": name,
+                        "uri": "test#" + base64.b64encode(bytes(range(61))).decode("ascii"),
+                        "files": {"resource.rpf": "rpf-hash"},
+                        "streamFiles": {"hackermx_labs.ydr": {"hash": "model-hash"}},
+                    }
+                    if file_server:
+                        resource["fileServer"] = file_server
+                    urls = {}
+
+                    def fake_download(url, _key, _iv, _out_path, file_name, _resource_name):
+                        urls[file_name] = requests.Request("GET", url).prepare().url
+                        return dumper._download_failure(file_name, 1, "test response", 404)
+
+                    with mock.patch.object(dumper, "download_and_decrypt", side_effect=fake_download):
+                        dumper.fetch_resource(resource, 1, 1)
+
+                    base_url = (file_server or "https://127.0.0.1:30120/files").rstrip("/")
+                    self.assertEqual(
+                        urls,
+                        {
+                            "resource.rpf": f"{base_url}/{name}/resource.rpf?hash=rpf-hash",
+                            "hackermx_labs.ydr": f"{base_url}/{name}/hackermx_labs.ydr?hash=model-hash",
+                        },
+                    )
+
     def test_supplement_download_only_schedules_failures_and_decrypt_prerequisite(self):
         dumper = auto.FiveMDumper(
             "https://127.0.0.1:30120",

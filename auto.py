@@ -341,6 +341,12 @@ def get_file_hash(file_data):
     return ""
 
 
+def encode_resource_name(resource_name):
+    # FiveM looks up the resource directly from the URL path without decoding it.
+    # Preserve existing escapes and parentheses in the configuration's name.
+    return quote(str(resource_name), safe="%()")
+
+
 def encode_file_path(file_name):
     return "/".join(
         quote(segment, safe="")
@@ -1250,7 +1256,7 @@ class FiveMDumper:
                 self.warn(item, f"[下载最终失败] {resource_name}/{fname}：文件缺少 hash，无法下载。")
                 continue
             base_url = (res.get("fileServer") or self.base_url + "/files").rstrip("/")
-            url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
+            url = f"{base_url}/{encode_resource_name(res['name'])}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
             rpf_key = hmac.new(hmac_key, fname.encode(), hashlib.sha256).digest()
             out_path = os.path.join(temp_dir if fname.endswith(".rpf") else unpacked_dir, fname)
             file_jobs.append((fname, url, rpf_key, iv, out_path, retry_requested, retry_prerequisite, decrypt_context))
@@ -1271,7 +1277,7 @@ class FiveMDumper:
                 self.warn(item, f"[下载最终失败] {resource_name}/{fname}：stream 文件缺少 hash，无法下载。")
                 continue
             base_url = (res.get("fileServer") or self.base_url + "/files").rstrip("/")
-            url = f"{base_url}/{quote(res['name'], safe='')}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
+            url = f"{base_url}/{encode_resource_name(res['name'])}/{encode_file_path(fname)}?hash={quote(str(hsh), safe='')}"
             s_key = hmac.new(hmac_key, fname.encode(), hashlib.sha256).digest()
             out_path = os.path.join(unpacked_dir, "stream", fname)
             file_jobs.append((fname, url, s_key, iv, out_path, retry_requested, False, False))
