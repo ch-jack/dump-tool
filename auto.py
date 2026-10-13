@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.19"
+TOOL_VERSION = "1.1.20"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -51,6 +51,8 @@ GRANTS_CLK_DERIVE_URL = "https://grantsclk.ckcloud.de5.net/v1/derive"
 GRANTS_CLK_REQUESTS_PER_MINUTE = 45
 GRANTS_CLK_MIN_INTERVAL_SECONDS = 60.0 / GRANTS_CLK_REQUESTS_PER_MINUTE
 GRANTS_CLK_MAX_ATTEMPTS = 3
+CITIZENFX_USER_AGENT = "CitizenFX/1"
+GET_ENDPOINTS_METHOD = "getEndpoints"
 STREAM_EXTENSIONS = {".yft", ".ytd", ".ydr", ".ydd", ".ybn", ".ymap", ".ytyp", ".ymf", ".awc"}
 RSC_HEADERS = (b"RSC7", b"RSC8")
 JAVA_MINIMUM_MAJOR = 8
@@ -798,7 +800,7 @@ def server_base_urls(value, address):
     return [f"https://{address}", f"http://{address}"]
 
 
-def resolve_server_endpoint(target):
+def resolve_server_endpoint(target, token=None):
     direct = direct_server_address(target)
     if direct:
         base_urls = server_base_urls(target, direct)
@@ -833,13 +835,45 @@ def resolve_server_endpoint(target):
             print(f"[地址] 已从 cfx.re 解析到服务器: {base_urls[0]}")
             return {"address": direct, "base_urls": base_urls}
 
-        raise RuntimeError(f"解析到的服务器地址无效: {header}")
+        parsed_header = urlparse(header if re.match(r"^https?://", header, re.I) else "//" + header)
+        if parsed_header.username or parsed_header.password or not parsed_header.hostname:
+            raise RuntimeError(f"解析到的服务器地址无效: {header}")
+        reference = parsed_header.netloc or parsed_header.hostname
+        if not token:
+            raise RuntimeError("无法获取 FiveM token，无法请求服务器真实地址。")
+
+        response = None
+        try:
+            response = requests.post(
+                f"{server_base_urls(header, reference)[0]}/client",
+                data={"method": GET_ENDPOINTS_METHOD, "token": token},
+                headers={"User-Agent": CITIZENFX_USER_AGENT},
+                timeout=15,
+                verify=False,
+            )
+            response.raise_for_status()
+            endpoints = response.json()
+        finally:
+            if response is not None:
+                response.close()
+
+        if not isinstance(endpoints, list):
+            raise RuntimeError("getEndpoints 响应格式无效。")
+        direct = next(
+            (direct_server_address(candidate) for candidate in endpoints if isinstance(candidate, str)),
+            None,
+        )
+        if not direct:
+            raise RuntimeError("getEndpoints 响应中没有有效的服务器地址。")
+        base_urls = server_base_urls(header, direct)
+        print(f"[地址] 已通过 getEndpoints 获取服务器真实地址: {base_urls[0]}")
+        return {"address": direct, "base_urls": base_urls}
     except Exception as exc:
         raise RuntimeError(f"从 {link} 解析服务器地址失败: {exc}") from exc
 
 
-def get_ip_from_cfx(target):
-    return resolve_server_endpoint(target)["address"]
+def get_ip_from_cfx(target, token=None):
+    return resolve_server_endpoint(target, token=token)["address"]
 
 
 class FiveMDumper:
@@ -867,7 +901,7 @@ class FiveMDumper:
         self.token = normalize_token(token)
         self.session = requests.Session()
         self.session.verify = False
-        self.session.headers.update({"X-CitizenFX-Token": self.token, "User-Agent": "CitizenFX/1"})
+        self.session.headers.update({"X-CitizenFX-Token": self.token, "User-Agent": CITIZENFX_USER_AGENT})
         self.max_workers = max_workers
         self.work_guard = work_guard
         self.keep_temp = bool(keep_temp)
@@ -2799,7 +2833,7 @@ def run_resource_listing(args):
 
         token = choose_token(args)
         emit_progress(15, "resolve", "Resolving server address")
-        endpoint = resolve_server_endpoint(target)
+        endpoint = resolve_server_endpoint(target, token=token)
         payload["server_address"] = endpoint["address"]
         payload["base_url"] = endpoint["base_urls"][0]
 
@@ -3083,7 +3117,7 @@ def run_tool(args):
         token = choose_token(args)
 
         emit_progress(15, "resolve", "正在解析服务器地址。")
-        endpoint = resolve_server_endpoint(target)
+        endpoint = resolve_server_endpoint(target, token=token)
         report["server_address"] = endpoint["address"]
         report["base_url"] = endpoint["base_urls"][0]
         print(f"[地址] 服务器地址: {endpoint['address']}")
