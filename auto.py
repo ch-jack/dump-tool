@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.20"
+TOOL_VERSION = "1.1.21"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -888,6 +888,7 @@ class FiveMDumper:
         retry_files_by_resource=None,
         include_decrypt_prerequisites=False,
         retry_resource_is_fxap=None,
+        download_stream=True,
     ):
         candidates = [base_url] + list(fallback_base_urls or [])
         self.base_urls = []
@@ -905,6 +906,7 @@ class FiveMDumper:
         self.max_workers = max_workers
         self.work_guard = work_guard
         self.keep_temp = bool(keep_temp)
+        self.download_stream = bool(download_stream)
         self.retry_files_by_resource = None
         if retry_files_by_resource is not None:
             self.retry_files_by_resource = {
@@ -1252,8 +1254,21 @@ class FiveMDumper:
         file_jobs = []
 
         files = res.get("files") or {}
-        stream_files = res.get("streamFiles") or {}
+        all_stream_files = res.get("streamFiles") or {}
         available_retry_names = set()
+        if not self.download_stream and retry_mode:
+            stream_retry_names = {
+                str(file_name).replace("\\", "/").casefold()
+                for file_name in all_stream_files
+            }
+            available_retry_names.update(stream_retry_names)
+            retry_lookup = {
+                normalized: original_name
+                for normalized, original_name in retry_lookup.items()
+                if normalized not in stream_retry_names
+            }
+            item["retry_requested_files"] = list(retry_lookup.values())
+        stream_files = all_stream_files if self.download_stream else {}
 
         def classify_retry_file(file_name, regular_file):
             normalized = str(file_name).replace("\\", "/").casefold()
@@ -2553,6 +2568,8 @@ def parse_args(argv):
     parser.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB, help="输出与临时磁盘必须保留的最小空间（GB）")
     parser.add_argument("--non-interactive", action="store_true", help="非交互模式，缺少必要信息时直接失败")
     parser.add_argument("--keep-temp", action="store_true", help="保留本次运行的临时工作区；默认逐资源处理后清理")
+    parser.add_argument("--download-stream", dest="download_stream", action="store_true", default=True, help="下载 stream 目录文件（默认）")
+    parser.add_argument("--no-download-stream", dest="download_stream", action="store_false", help="跳过 stream 目录文件下载")
     parser.add_argument("--no-fxap-decrypt", action="store_true", help="不执行 FXAP 解密，将下载、解包后的原始资源（含 .fxap）按完整目录复制到输出")
     parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行模型修复")
     return parser.parse_args(argv)
@@ -2601,6 +2618,7 @@ def build_markdown_report(report):
         "## 功能范围",
         "",
         f"- 服务器 Dump: {'包含' if scope.get('serverDump') else '不包含'}",
+        f"- stream 文件下载: {'包含' if scope.get('streamDownload', True) else '跳过'}",
         f"- FXAP 解密: {'包含' if scope.get('fxapDecrypt') else '不包含'}",
         f"- 原始 FXAP 资源完整保留: {'包含' if scope.get('rawResourcePreservation') else '不包含'}",
         f"- 模型修复: {'包含（可选）' if scope.get('modelRepair') or scope.get('vertexFix') else '不包含'}",
@@ -2928,6 +2946,7 @@ def run_tool(args):
         },
         "scope": {
             "serverDump": True,
+            "streamDownload": bool(args.download_stream),
             "fxapDecrypt": decrypt_enabled,
             "rawResourcePreservation": not decrypt_enabled,
             "vertexFix": bool(args.vertex_fix),
@@ -3059,6 +3078,7 @@ def run_tool(args):
 
         print("=== FiveM 服务器 Dump 与 FXAP 解密工具 ===")
         feature_text = "包含服务器 Dump"
+        feature_text += "、stream 文件下载" if args.download_stream else "（跳过 stream 文件下载）"
         if decrypt_enabled:
             feature_text += "、FXAP 解密"
         else:
@@ -3137,6 +3157,7 @@ def run_tool(args):
             max_workers=15,
             work_guard=work_guard,
             keep_temp=args.keep_temp,
+            download_stream=args.download_stream,
             fallback_base_urls=endpoint["base_urls"][1:],
             retry_files_by_resource=retry_plan["files_by_resource"] if retry_plan else None,
             include_decrypt_prerequisites=bool(retry_plan and decrypt_enabled),
