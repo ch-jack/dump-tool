@@ -53,6 +53,7 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --no-fxap-decrypt
 python auto.py 1.2.3.4:30120 --token-choice 1 --no-download-stream
 python auto.py 1.2.3.4:30120 --token-choice 1 --vertex-fix
 python auto.py --retry-failed-report "C:\path\to\previous-report.json" --non-interactive
+python auto.py --resume-session "C:\path\to\session.json" --non-interactive
 ```
 
 非交互模式，供 CK 工具箱调用：
@@ -97,6 +98,8 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 - 默认下载资源 `stream` 目录下的文件；`--no-download-stream` 会跳过 stream 文件下载
 - `--no-fxap-decrypt` 不能与 `--vertex-fix` 同时使用；模型修复只适用于成功解密后的副本
 - `--retry-failed-report` 读取上一次 JSON 报告，只选择其中 `failed_downloads` 和等待解密前置文件的项目重新下载，并合并回报告记录的原输出目录；新报告可以继续用于下一轮补充
+- Dump 会在任务目录保存 `session.json`；连接中断后工具箱显示“继续 Dump”，重新进入游戏后点击即可重新扫描 token 并跳过已经完成的资源。未完成文件使用 `.part` 临时文件，继续时重新下载。
+- 选择“开始服务器 Dump”会创建新的任务，不会接管之前暂停的任务；旧任务状态和已完成输出会保留。
 - 解密模式补充 stream/普通文件时会额外下载该资源必要的 RPF/`.fxap` 上下文，否则无法安全解密；已经成功且不是解密前置的文件不会重复下载
 - 补充下载不会自动执行模型修复；它只更新原解密输出或原始保留输出，避免覆盖已有的模型修复副本
 - 旧报告中的资源如果已从服务器移除或改名，会标记为 `unavailable` 并保留到下一轮；其他仍存在的资源会继续补充，不会再被少数缺失资源整体阻断
@@ -106,7 +109,7 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 ## 注意事项
 
 - 请只在你有权限分析的服务器或资源上使用。
-- Dump 过程中不要关闭 FiveM 或本工具。
+- Dump 中途关闭 FiveM 后，重新进入目标服务器并使用任务状态继续；不要删除任务目录中的 `session.json`。
 - 如果自动扫描 token 失败，请确认 FiveM 已进入服务器，或以管理员身份运行。
 - 杀毒软件可能会根据本机策略对进程读取或打包工具提示风险。
 

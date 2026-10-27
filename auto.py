@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.21"
+TOOL_VERSION = "1.1.22"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -45,6 +45,7 @@ DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 DOWNLOAD_RETRY_MAX_SECONDS = 8.0
 DOWNLOAD_RETRY_AFTER_MAX_SECONDS = 30.0
 DOWNLOAD_RETRY_STATUS_CODES = {403, 404, 408, 409, 425, 429, 500, 502, 503, 504}
+DOWNLOAD_SESSION_RETRY_STATUS_CODES = {403, 408, 409, 425, 429, 500, 502, 503, 504}
 VERTEX_FIXER_CLI = SCRIPT_DIR / "FIXER" / "FivemDecryptFixer.Cli.exe"
 VERTEX_FIX_EXTENSIONS = {".ydr", ".yft", ".ydd"}
 GRANTS_CLK_DERIVE_URL = "https://grantsclk.ckcloud.de5.net/v1/derive"
@@ -123,6 +124,28 @@ def emit_progress(percent, stage, message):
 
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def write_json_atomic(path, payload):
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(str(temporary), str(path))
+
+
+def load_dump_session(file_path):
+    path = Path(file_path).expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"Dump 任务状态不存在: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"无法读取 Dump 任务状态 {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("command") != "server-dump":
+        raise RuntimeError("Dump 任务状态格式无效。")
+    payload["session_file"] = str(path)
+    return payload
 
 
 def safe_name(name: str) -> str:
@@ -517,6 +540,10 @@ class DiskSpaceError(RuntimeError):
     pass
 
 
+class SessionPauseError(RuntimeError):
+    pass
+
+
 class ResourceSelectionCancelled(RuntimeError):
     pass
 
@@ -751,7 +778,7 @@ def get_token():
 
     proc = find_fivem_process()
     if not proc:
-        raise RuntimeError("未找到 FiveM 进程，请先进入目标服务器。")
+        raise SessionPauseError("未找到 FiveM 进程，请启动并进入目标服务器后点击继续 Dump。")
 
     handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, proc.pid)
     if not handle:
@@ -868,6 +895,8 @@ def resolve_server_endpoint(target, token=None):
         base_urls = server_base_urls(header, direct)
         print(f"[地址] 已通过 getEndpoints 获取服务器真实地址: {base_urls[0]}")
         return {"address": direct, "base_urls": base_urls}
+    except requests.exceptions.RequestException as exc:
+        raise SessionPauseError(f"服务器地址解析连接失败：{exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"从 {link} 解析服务器地址失败: {exc}") from exc
 
@@ -970,10 +999,13 @@ class FiveMDumper:
                 js = resp.json()
                 break
             except requests.exceptions.HTTPError:
-                raise
+                if index + 1 >= len(self.base_urls):
+                    raise SessionPauseError(f"服务器配置请求失败：{self.base_url}")
+                next_base_url = self.base_urls[index + 1]
+                print_warning(f"{base_url} 配置请求失败，正在改用 {next_base_url}。")
             except requests.exceptions.RequestException as exc:
                 if index + 1 >= len(self.base_urls):
-                    raise
+                    raise SessionPauseError(f"服务器连接失败：{exc}") from exc
                 next_base_url = self.base_urls[index + 1]
                 print_warning(f"{base_url} 连接失败，正在改用 {next_base_url}：{exc}")
 
@@ -1003,7 +1035,7 @@ class FiveMDumper:
         jittered_delay = base_delay * random.uniform(0.8, 1.2)
         return min(DOWNLOAD_RETRY_MAX_SECONDS, jittered_delay)
 
-    def _download_failure(self, file_name, attempts, error, status_code=None):
+    def _download_failure(self, file_name, attempts, error, status_code=None, connection_lost=False):
         return {
             "path": None,
             "file": file_name,
@@ -1013,6 +1045,7 @@ class FiveMDumper:
             "status_code": status_code,
             "failure_stage": "download",
             "error": str(error),
+            "connection_lost": bool(connection_lost),
         }
 
     def download_and_decrypt(self, url, key, iv, out_path, file_name, resource_name=""):
@@ -1040,7 +1073,13 @@ class FiveMDumper:
                 reason = str(response.reason or "HTTP 请求失败").strip()
                 error = f"HTTP {status_code} {reason}".strip()
                 if status_code not in DOWNLOAD_RETRY_STATUS_CODES or attempt >= DOWNLOAD_MAX_ATTEMPTS:
-                    return self._download_failure(file_name, attempts, error, status_code)
+                    return self._download_failure(
+                        file_name,
+                        attempts,
+                        error,
+                        status_code,
+                        connection_lost=status_code in DOWNLOAD_SESSION_RETRY_STATUS_CODES,
+                    )
 
                 delay = self._download_retry_delay(response, attempt)
                 print_warning(
@@ -1050,14 +1089,20 @@ class FiveMDumper:
             except retryable_exceptions as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 if attempt >= DOWNLOAD_MAX_ATTEMPTS:
-                    return self._download_failure(file_name, attempts, error, status_code)
+                    return self._download_failure(file_name, attempts, error, status_code, connection_lost=True)
                 delay = self._download_retry_delay(None, attempt)
                 print_warning(
                     f"[下载重试] {resource_name}/{file_name} 第 {attempt}/{DOWNLOAD_MAX_ATTEMPTS} 次请求异常："
                     f"{error}；{delay:.1f} 秒后重试。"
                 )
             except requests.exceptions.RequestException as exc:
-                return self._download_failure(file_name, attempts, f"{type(exc).__name__}: {exc}", status_code)
+                return self._download_failure(
+                    file_name,
+                    attempts,
+                    f"{type(exc).__name__}: {exc}",
+                    status_code,
+                    connection_lost=True,
+                )
             except Exception as exc:
                 return self._download_failure(file_name, attempts, f"{type(exc).__name__}: {exc}", status_code)
             finally:
@@ -1067,7 +1112,7 @@ class FiveMDumper:
             time.sleep(delay)
 
         if encrypted is None:
-            return self._download_failure(file_name, attempts, "服务器没有返回文件内容", status_code)
+            return self._download_failure(file_name, attempts, "服务器没有返回文件内容", status_code, connection_lost=True)
 
         try:
             try:
@@ -1094,9 +1139,17 @@ class FiveMDumper:
             try:
                 if self.work_guard:
                     self.work_guard.check(required_bytes=len(dec))
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                with open(out_path, "wb") as f:
+                output_parent = os.path.dirname(out_path)
+                if output_parent:
+                    os.makedirs(output_parent, exist_ok=True)
+                part_path = out_path + ".part"
+                try:
+                    os.remove(part_path)
+                except FileNotFoundError:
+                    pass
+                with open(part_path, "wb") as f:
                     f.write(dec)
+                os.replace(part_path, out_path)
                 return {
                     "path": out_path,
                     "file": file_name,
@@ -1112,6 +1165,10 @@ class FiveMDumper:
             except OSError as exc:
                 if is_disk_full_error(exc) and self.work_guard:
                     self.work_guard.raise_write_error(exc)
+                try:
+                    os.remove(out_path + ".part")
+                except FileNotFoundError:
+                    pass
                 return {
                     "path": None,
                     "file": file_name,
@@ -1122,6 +1179,10 @@ class FiveMDumper:
                     "error": f"写入文件失败: {exc}",
                 }
             except Exception as exc:
+                try:
+                    os.remove(out_path + ".part")
+                except FileNotFoundError:
+                    pass
                 return {
                     "path": None,
                     "file": file_name,
@@ -1394,6 +1455,13 @@ class FiveMDumper:
                         "error": str(exc),
                     }
 
+                if result.get("connection_lost"):
+                    for pending in future_map:
+                        pending.cancel()
+                    raise SessionPauseError(
+                        f"服务器连接中断，{resource_name}/{fname} 下载未完成；请重新打开游戏后点击继续 Dump。"
+                    )
+
                 retries = int(result.get("retries", 0) or 0)
                 if retries > 0:
                     item["download_retried_files"] += 1
@@ -1536,6 +1604,12 @@ class FiveMDumper:
         resources = self.get_configuration()
         chosen = self.select_resources(resources, resources_choice)
         self.summary["resources_selected"] = len(chosen)
+        on_resources_selected = getattr(self, "on_resources_selected", None)
+        on_resource_complete = getattr(self, "on_resource_complete", None)
+        if on_resources_selected:
+            on_resources_selected([str(resource.get("name", "")) for resource in chosen])
+
+        completed_names = {str(name) for name in (getattr(self, "completed_resources", None) or []) if str(name)}
 
         if self.retry_files_by_resource is not None and self.unmatched_retry_resources:
             unavailable_names = self.unmatched_retry_resources
@@ -1582,11 +1656,17 @@ class FiveMDumper:
         for idx, res in enumerate(chosen, start=1):
             resource_name = res.get("name", f"resource_{idx}")
             resource_safe_name = safe_name(resource_name)
+            if resource_name in completed_names:
+                print(f"[恢复] 已完成资源，跳过: {resource_name}")
+                continue
             try:
                 item = self.fetch_resource(res, idx, len(chosen))
                 unpacked_dir = os.path.join("Unpacked", resource_safe_name)
+                processed = True
                 if on_resource_ready and os.path.isdir(unpacked_dir):
-                    on_resource_ready(unpacked_dir, resource_safe_name, item)
+                    processed = bool(on_resource_ready(unpacked_dir, resource_safe_name, item))
+                if processed and item.get("status") == "success" and on_resource_complete:
+                    on_resource_complete(str(resource_name))
             finally:
                 if not self.keep_temp:
                     self.cleanup_resource_temp(resource_safe_name)
@@ -2560,6 +2640,8 @@ def parse_args(argv):
     parser.add_argument("--resources", default=None, help="资源选择：支持 all、序号、精确名称和 *、? 通配符，多个条件用逗号分隔；非交互模式默认 all")
     parser.add_argument("--resources-file", default="", help="包含精确资源名数组的 JSON 文件")
     parser.add_argument("--retry-failed-report", default="", help="读取上一次 server-dump JSON 报告，只补充下载其中失败或待处理的文件并合并回原输出目录")
+    parser.add_argument("--session-file", default="", help="保存本次 Dump 任务状态的 JSON 文件")
+    parser.add_argument("--resume-session", default="", help="从之前中断的 Dump 任务状态继续")
     parser.add_argument("--list-resources", action="store_true", help="仅获取并输出服务器资源清单，不执行 Dump")
     parser.add_argument("--output", default="Output", help="Dump 处理输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
@@ -2632,6 +2714,12 @@ def build_markdown_report(report):
         f"- 启动时输出盘剩余: {storage.get('output_initial_free_gb', '')} GB",
         f"- 启动时临时盘剩余: {storage.get('temp_initial_free_gb', '')} GB",
         f"- 结束时输出盘剩余: {storage.get('output_final_free_gb', '')} GB",
+        "",
+        "## 任务恢复",
+        "",
+        f"- 可继续: {'是' if report.get('resume', {}).get('available') else '否'}",
+        f"- 任务状态文件: {report.get('resume', {}).get('session_file', '')}",
+        f"- 已恢复运行: {'是' if report.get('resume', {}).get('resumed') else '否'}",
         "",
         "## Java 环境",
         "",
@@ -2883,6 +2971,28 @@ def run_tool(args):
     os.chdir(SCRIPT_DIR)
     start_time = time.time()
     started_at = now_iso()
+    resume_state = None
+    if args.resume_session:
+        if args.retry_failed_report:
+            raise RuntimeError("不能同时使用 --resume-session 和 --retry-failed-report。")
+        resume_state = load_dump_session(args.resume_session)
+        args.target = str(resume_state.get("target") or args.target or "")
+        args.output = str(resume_state.get("output") or args.output or "Output")
+        args.report = str(resume_state.get("report_path") or args.report or "")
+        args.session_file = str(resume_state.get("session_file") or args.resume_session)
+        args.resources = list(resume_state.get("resources") or []) or resume_state.get("resources_requested") or "all"
+        args.resources_file = ""
+        args.non_interactive = True
+        settings = resume_state.get("settings") or {}
+        if "download_stream" in settings:
+            args.download_stream = bool(settings.get("download_stream"))
+        if "fxap_decrypt" in settings:
+            args.no_fxap_decrypt = not bool(settings.get("fxap_decrypt"))
+        if "vertex_fix" in settings:
+            args.vertex_fix = bool(settings.get("vertex_fix"))
+        if settings.get("java") and not args.java:
+            args.java = str(settings.get("java"))
+
     retry_plan = None
     retry_plan_error = ""
     if args.retry_failed_report:
@@ -2908,6 +3018,11 @@ def run_tool(args):
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path, markdown_path = resolve_report_paths(args.report, output_dir)
+    session_path = Path(args.session_file).expanduser() if args.session_file else output_dir / "_ck_dump_session.json"
+    if not session_path.is_absolute():
+        session_path = (Path.cwd() / session_path).resolve()
+    else:
+        session_path = session_path.resolve()
 
     minimum_free_gb = max(1.0, float(args.min_free_gb or DEFAULT_MIN_FREE_GB))
     work_dir = create_work_dir(args.temp_dir, output_dir)
@@ -2972,6 +3087,13 @@ def run_tool(args):
         "dump_resources": [],
         "decrypt_resources": [],
         "raw_resources": [],
+        "resume": {
+            "enabled": True,
+            "session_file": str(session_path),
+            "resumed": bool(resume_state),
+            "available": True,
+            "completed_resources": list(resume_state.get("completed_resources") or []) if resume_state else [],
+        },
         "retry_failed": {
             "enabled": bool(args.retry_failed_report),
             "source_report": retry_plan["source_report"] if retry_plan else str(args.retry_failed_report or ""),
@@ -2989,6 +3111,46 @@ def run_tool(args):
     exit_code = 0
     dumper = None
     decryptor = None
+    session_data = dict(resume_state or {})
+    session_data.update(
+        {
+            "schemaVersion": 1,
+            "command": "server-dump",
+            "status": "running",
+            "target": report["target"],
+            "output": str(output_dir),
+            "report_path": str(json_path),
+            "session_file": str(session_path),
+            "resources_requested": args.resources_file or args.resources or ("all" if args.non_interactive else ""),
+            "updated_at": started_at,
+        }
+    )
+    session_data.setdefault("resources", [])
+    session_data["completed_resources"] = list(
+        dict.fromkeys(str(name) for name in (session_data.get("completed_resources") or []) if str(name))
+    )
+    session_data["settings"] = {
+        "download_stream": bool(args.download_stream),
+        "fxap_decrypt": not bool(args.no_fxap_decrypt),
+        "vertex_fix": bool(args.vertex_fix),
+        "java": str(args.java or ""),
+    }
+
+    def save_session(status=None):
+        if status:
+            session_data["status"] = str(status)
+        session_data["updated_at"] = now_iso()
+        session_data["target"] = report.get("target") or session_data.get("target") or ""
+        session_data["output"] = str(output_dir)
+        session_data["report_path"] = str(json_path)
+        session_data["session_file"] = str(session_path)
+        session_data["resources_requested"] = report.get("resources_requested") or session_data.get("resources_requested") or ""
+        session_data["completed_resources"] = list(
+            dict.fromkeys(str(name) for name in (session_data.get("completed_resources") or []) if str(name))
+        )
+        write_json_atomic(session_path, session_data)
+
+    save_session()
 
     def update_report_summaries():
         if dumper is not None:
@@ -3101,6 +3263,8 @@ def run_tool(args):
             java_info["requested"] = args.java or ""
             java_info["required"] = True
             report["java"] = java_info
+            session_data["settings"]["java"] = str(java_info.get("path") or args.java or "")
+            save_session()
             print(f"[Java] 已就绪: {java_info['version']} ({java_info['path']})")
             if int(java_info.get("major", 0)) < JAVA_RECOMMENDED_MAJOR:
                 print(f"[Java] 当前版本可用，推荐升级到 Java {JAVA_RECOMMENDED_MAJOR}。")
@@ -3123,11 +3287,16 @@ def run_tool(args):
         if not target:
             raise RuntimeError("缺少目标地址，请输入 cfx.re 链接或 IP:端口。")
         report["target"] = target
+        session_data["target"] = target
+        save_session()
 
         resources_choice = list(retry_plan["files_by_resource"].keys()) if retry_plan else (load_resource_selection_file(args.resources_file) if args.resources_file else args.resources)
         if args.non_interactive and not resources_choice and not retry_plan:
             resources_choice = "all"
         report["resources_requested"] = resources_choice or ""
+        if isinstance(resources_choice, (list, tuple, set)):
+            session_data["resources"] = [str(name) for name in resources_choice if str(name)]
+        save_session()
         if retry_plan:
             print(
                 f"[补充下载] 来源报告: {retry_plan['source_report']}；"
@@ -3164,6 +3333,17 @@ def run_tool(args):
             retry_resource_is_fxap=retry_plan["resource_is_fxap"] if retry_plan else None,
         )
 
+        completed_resources = set(str(name) for name in (session_data.get("completed_resources") or []) if str(name))
+
+        def on_resources_selected(selected_names):
+            session_data["resources"] = [str(name) for name in selected_names if str(name)]
+            save_session()
+
+        def on_resource_complete(resource_name):
+            completed_resources.add(str(resource_name))
+            session_data["completed_resources"] = sorted(completed_resources)
+            save_session()
+
         def process_ready_resource(resource_path, resource_name, dump_item):
             if decrypt_enabled:
                 if retry_plan:
@@ -3187,9 +3367,10 @@ def run_tool(args):
                             f"已下载的 {len(pending)} 个文件暂未写入解密输出，下次补充会继续处理。"
                         )
                         decryptor.record_retry_prerequisite_failure(resource_name, message, is_fxap=True)
-                        return
+                        return False
                 print(f"[流水线] Dump 完成，立即处理 FXAP 并释放临时文件: {resource_name}")
-                decryptor.decrypt_resource(resource_path, resource_name)
+                result = decryptor.decrypt_resource(resource_path, resource_name)
+                return result.get("status") in ("decrypted", "copied")
             else:
                 print(f"[流水线] Dump 完成，立即完整复制原始资源（含 .fxap）并释放临时文件: {resource_name}")
                 raw_item = decryptor.preserve_raw_resource(
@@ -3201,7 +3382,11 @@ def run_tool(args):
                 if retry_plan and raw_item.get("status") == "raw_preserved":
                     raw_item["status"] = "raw_supplemented"
                     raw_item["retry_supplement"] = True
+                return raw_item.get("status") in ("raw_preserved", "raw_supplemented")
 
+        dumper.completed_resources = completed_resources
+        dumper.on_resources_selected = on_resources_selected
+        dumper.on_resource_complete = on_resource_complete
         dumper.run(resources_choice, on_resource_ready=process_ready_resource)
         report["base_url"] = dumper.base_url
         print("[Dump] 服务器 Dump 阶段完成。")
@@ -3241,6 +3426,13 @@ def run_tool(args):
         message = str(exc)
         report["warnings"].append(message)
         print_warning(message)
+    except SessionPauseError as exc:
+        exit_code = 11
+        report["status"] = "paused"
+        message = str(exc)
+        report["warnings"].append(message)
+        report["resume"]["available"] = True
+        print_warning(message)
     except DiskSpaceError as exc:
         exit_code = 12
         report["status"] = "error"
@@ -3267,6 +3459,16 @@ def run_tool(args):
                     exit_code = 10
             else:
                 report["status"] = "success"
+
+        report["resume"]["completed_resources"] = list(session_data.get("completed_resources") or [])
+        if report["status"] == "success":
+            report["resume"]["available"] = False
+            save_session("completed")
+        elif report["status"] == "paused":
+            save_session("paused")
+        else:
+            report["resume"]["available"] = False
+            save_session("failed")
 
         try:
             cleanup_temp(work_dir, args.keep_temp)
