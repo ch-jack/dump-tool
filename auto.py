@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.23"
+TOOL_VERSION = "1.1.24"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -323,30 +323,41 @@ def run_vertex_fix(decrypt_resources, output_dir, output_guard=None):
                 model_file_count += 1
 
         print(f"[模型修复] 已隔离 {model_file_count} 个 .ydr/.yft/.ydd 文件；其他文件不会交给修复器。")
-        proc = subprocess.run(
+        print("[模型修复] 修复器已启动，正在处理模型。")
+        proc = subprocess.Popen(
             [str(VERTEX_FIXER_CLI), "fix-models", str(work_root)],
             cwd=str(VERTEX_FIXER_CLI.parent),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
+            bufsize=1,
         )
+        combined_lines = []
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            combined_lines.append(line)
+            print_external_line("[模型修复] ", line)
+            progress_match = re.search(r"\[MODEL(?:\]|\s)\s*(\d+)/(\d+)", line)
+            if progress_match:
+                current = int(progress_match.group(1))
+                total = max(1, int(progress_match.group(2)))
+                emit_progress(90 + int(3 * current / total), "vertex_fix", f"正在修复模型: {current}/{total}")
+        proc.wait()
 
+        print("[模型修复] 修复器已结束，正在写回修复结果。")
         for repaired_path in work_root.rglob("*"):
             if repaired_path.is_file() and repaired_path.suffix.lower() in VERTEX_FIX_EXTENSIONS:
                 destination = fixed_root / repaired_path.relative_to(work_root)
                 shutil.copy2(repaired_path, destination)
+        print(f"[模型修复] 修复结果已写回，共处理 {model_file_count} 个模型文件。")
     finally:
         if work_root.exists():
             shutil.rmtree(work_root, ignore_errors=True)
     result["exit_code"] = int(proc.returncode)
-    combined_lines = []
-    for text in (proc.stdout, proc.stderr):
-        for line in (text or "").splitlines():
-            if line.strip():
-                combined_lines.append(line.rstrip())
-                print_external_line("[模型修复] ", line.rstrip())
 
     summary_pattern = re.compile(r"\[MODEL\]\s+scanned=(\d+),\s*repaired=(\d+),\s*failed=(\d+)")
     for line in reversed(combined_lines):
