@@ -1,4 +1,6 @@
 import base64
+import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +38,27 @@ class FakeSession:
 
 
 class ResumeTests(unittest.TestCase):
+    def test_wait_mode_writes_status_and_pauses_without_token(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "status.json"
+            auto.STATUS_FILE = str(status_path)
+            auto.update_status_file(
+                status="waiting-game",
+                percent=4,
+                stage="token",
+                message="等待 FiveM",
+                completed_resources=2,
+            )
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "waiting-game")
+            self.assertEqual(payload["completed_resources"], 2)
+
+        args = argparse.Namespace(token_choice="1", token="", non_interactive=True, wait_for_game=True)
+        with mock.patch.object(auto, "get_token", return_value=None):
+            with self.assertRaises(auto.SessionPauseError):
+                auto.choose_token(args)
+        auto.STATUS_FILE = None
+
     def test_session_is_written_atomically_and_loaded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session.json"

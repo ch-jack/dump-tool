@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.22"
+TOOL_VERSION = "1.1.23"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -58,6 +58,8 @@ STREAM_EXTENSIONS = {".yft", ".ytd", ".ydr", ".ydd", ".ybn", ".ymap", ".ytyp", "
 RSC_HEADERS = (b"RSC7", b"RSC8")
 JAVA_MINIMUM_MAJOR = 8
 JAVA_RECOMMENDED_MAJOR = 17
+STATUS_FILE = None
+STATUS_PERCENT = 0
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
@@ -114,12 +116,23 @@ def print_external_line(prefix, value):
 
 
 def emit_progress(percent, stage, message):
+    global STATUS_PERCENT
+    STATUS_PERCENT = max(0, min(100, int(percent)))
     payload = {
-        "percent": max(0, min(100, int(percent))),
+        "percent": STATUS_PERCENT,
         "stage": str(stage),
         "message": str(message),
     }
     print_external_line("", "CK_PROGRESS " + json.dumps(payload, ensure_ascii=False))
+    try:
+        update_status_file(
+            status="running",
+            percent=payload["percent"],
+            stage=payload["stage"],
+            message=payload["message"],
+        )
+    except Exception:
+        pass
 
 
 def now_iso():
@@ -132,6 +145,53 @@ def write_json_atomic(path, payload):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(str(temporary), str(path))
+
+
+def update_status_file(
+    status=None,
+    percent=None,
+    stage=None,
+    message=None,
+    target=None,
+    output=None,
+    session_file=None,
+    report_file=None,
+    completed_resources=None,
+):
+    if not STATUS_FILE:
+        return
+
+    path = Path(STATUS_FILE).expanduser().resolve()
+    payload = {}
+    try:
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(payload, dict):
+                payload = {}
+    except Exception:
+        payload = {}
+
+    if status is not None:
+        payload["status"] = str(status)
+    if percent is not None:
+        payload["percent"] = max(0, min(100, int(percent)))
+    if stage is not None:
+        payload["stage"] = str(stage)
+    if message is not None:
+        payload["message"] = str(message)
+    if target is not None:
+        payload["target"] = str(target)
+    if output is not None:
+        payload["output"] = str(output)
+    if session_file is not None:
+        payload["session_file"] = str(session_file)
+    if report_file is not None:
+        payload["report_file"] = str(report_file)
+    if completed_resources is not None:
+        payload["completed_resources"] = int(completed_resources)
+    payload["pid"] = os.getpid()
+    payload["updated_at"] = now_iso()
+    write_json_atomic(path, payload)
 
 
 def load_dump_session(file_path):
@@ -2654,6 +2714,8 @@ def parse_args(argv):
     parser.add_argument("--no-download-stream", dest="download_stream", action="store_false", help="跳过 stream 目录文件下载")
     parser.add_argument("--no-fxap-decrypt", action="store_true", help="不执行 FXAP 解密，将下载、解包后的原始资源（含 .fxap）按完整目录复制到输出")
     parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行模型修复")
+    parser.add_argument("--wait-for-game", action="store_true", help="等待 FiveM 进服或重新连接后自动继续 Dump")
+    parser.add_argument("--status-file", default="", help="写入后台任务进度的 JSON 文件")
     return parser.parse_args(argv)
 
 
@@ -2905,6 +2967,8 @@ def choose_token(args):
     if not token and args.token:
         token = args.token.strip()
         print("[Token] 自动扫描失败，已使用命令行提供的备用 token。")
+    if not token and getattr(args, "wait_for_game", False):
+        raise SessionPauseError("未找到 FiveM token，等待进入目标服务器后重试。")
     if not token and not args.non_interactive:
         fallback = input("未找到 token，是否手动输入？(y/N): ").strip().lower()
         if fallback in ["y", "yes", "是"]:
@@ -2968,6 +3032,9 @@ def run_resource_listing(args):
 
 
 def run_tool(args):
+    global STATUS_FILE, STATUS_PERCENT
+    STATUS_FILE = str(Path(args.status_file).expanduser().resolve()) if args.status_file else None
+    STATUS_PERCENT = 0
     os.chdir(SCRIPT_DIR)
     start_time = time.time()
     started_at = now_iso()
@@ -3121,6 +3188,7 @@ def run_tool(args):
             "output": str(output_dir),
             "report_path": str(json_path),
             "session_file": str(session_path),
+            "status_file": str(STATUS_FILE or ""),
             "resources_requested": args.resources_file or args.resources or ("all" if args.non_interactive else ""),
             "updated_at": started_at,
         }
@@ -3149,6 +3217,14 @@ def run_tool(args):
             dict.fromkeys(str(name) for name in (session_data.get("completed_resources") or []) if str(name))
         )
         write_json_atomic(session_path, session_data)
+        update_status_file(
+            status=session_data["status"],
+            target=report.get("target") or session_data.get("target") or "",
+            output=str(output_dir),
+            session_file=session_path,
+            report_file=json_path,
+            completed_resources=len(session_data["completed_resources"]),
+        )
 
     save_session()
 
@@ -3496,7 +3572,14 @@ def run_tool(args):
             report["errors"].append(f"报告生成失败: {exc}")
             if exit_code == 0:
                 exit_code = 10
+        progress_before_done = STATUS_PERCENT
         emit_progress(100, "done", "任务结束。")
+        update_status_file(
+            status=report["status"],
+            percent=100 if report["status"] in ("success", "partial", "error", "failed") else progress_before_done,
+            stage="done",
+            message="任务完成。" if report["status"] == "success" else f"任务{report['status']}。",
+        )
         print("[完成] 脚本已结束，请查看输出目录和本次报告。")
         print(json.dumps(report, ensure_ascii=False), flush=True)
 
@@ -3507,7 +3590,28 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.list_resources:
         return run_resource_listing(args)
-    return run_tool(args)
+    if not args.wait_for_game:
+        return run_tool(args)
+
+    if not args.session_file:
+        output_dir = Path(args.output or "Output")
+        if not output_dir.is_absolute():
+            output_dir = SCRIPT_DIR / output_dir
+        args.session_file = str(output_dir / "_ck_silent_session.json")
+    if not args.status_file:
+        args.status_file = str(Path(args.session_file).with_name("status.json"))
+
+    while True:
+        exit_code = run_tool(args)
+        if exit_code != 11:
+            return exit_code
+        args.resume_session = args.session_file
+        update_status_file(
+            status="waiting-game",
+            stage="waiting-game",
+            message="等待 FiveM 进服或重新连接后继续 Dump。",
+        )
+        time.sleep(5)
 
 
 if __name__ == "__main__":
