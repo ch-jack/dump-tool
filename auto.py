@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.24"
+TOOL_VERSION = "1.1.25"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -2725,6 +2725,7 @@ def parse_args(argv):
     parser.add_argument("--no-download-stream", dest="download_stream", action="store_false", help="跳过 stream 目录文件下载")
     parser.add_argument("--no-fxap-decrypt", action="store_true", help="不执行 FXAP 解密，将下载、解包后的原始资源（含 .fxap）按完整目录复制到输出")
     parser.add_argument("--vertex-fix", action="store_true", help="FXAP 解密完成后，在原输出目录旁复制完整资源并对副本执行模型修复")
+    parser.add_argument("--auto-open", action="store_true", help="任务完成后自动打开输出目录")
     parser.add_argument("--wait-for-game", action="store_true", help="等待 FiveM 进服或重新连接后自动继续 Dump")
     parser.add_argument("--status-file", default="", help="写入后台任务进度的 JSON 文件")
     return parser.parse_args(argv)
@@ -3591,6 +3592,19 @@ def run_tool(args):
             stage="done",
             message="任务完成。" if report["status"] == "success" else f"任务{report['status']}。",
         )
+        if args.auto_open and report["status"] in ("success", "partial"):
+            open_path = Path(output_dir)
+            vertex_output = (report.get("vertex_fix") or {}).get("output")
+            if args.vertex_fix and vertex_output and Path(vertex_output).is_dir():
+                open_path = Path(vertex_output)
+            if open_path.is_dir():
+                try:
+                    if os.name == "nt":
+                        os.startfile(str(open_path))
+                    else:
+                        subprocess.Popen(["xdg-open", str(open_path)])
+                except OSError as exc:
+                    print_warning(f"自动打开输出目录失败: {exc}")
         print("[完成] 脚本已结束，请查看输出目录和本次报告。")
         print(json.dumps(report, ensure_ascii=False), flush=True)
 
