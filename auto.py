@@ -36,7 +36,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.25"
+TOOL_VERSION = "1.1.26"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -1525,13 +1525,6 @@ class FiveMDumper:
                         "failure_stage": "process",
                         "error": str(exc),
                     }
-
-                if result.get("connection_lost"):
-                    for pending in future_map:
-                        pending.cancel()
-                    raise SessionPauseError(
-                        f"服务器连接中断，{resource_name}/{fname} 下载未完成；请重新打开游戏后点击继续 Dump。"
-                    )
 
                 retries = int(result.get("retries", 0) or 0)
                 if retries > 0:
