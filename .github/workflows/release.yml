@@ -66,6 +66,7 @@ jobs:
 
           $required = @(
             'auto.py',
+            'fivem_connection_probe.py',
             'requirements.txt',
             'install.bat',
             'Bin\Unpacker.exe',
@@ -86,6 +87,7 @@ jobs:
 
           $items = @(
             'auto.py',
+            'fivem_connection_probe.py',
             'requirements.txt',
             'README.md',
             'd.bat',

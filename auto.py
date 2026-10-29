@@ -6,6 +6,7 @@ import errno
 from fnmatch import fnmatchcase
 import hashlib
 import hmac
+import importlib.util
 import ipaddress
 import json
 import os
@@ -36,7 +37,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.26"
+TOOL_VERSION = "1.1.27"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -2699,6 +2700,7 @@ def parse_args(argv):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("target", nargs="?", help="cfx.re 链接或 IP:端口，例如 https://cfx.re/join/xxxx 或 1.2.3.4:30120")
+    parser.add_argument("--auto-target", action="store_true", help="目标为空时从当前 FiveM 进程扫描并用 Token 验证服务器地址")
     parser.add_argument("--token-choice", choices=["1", "2"], default="1", help="1 自动扫描 FiveM token，2 使用手动 token")
     parser.add_argument("--token", default="", help="手动 token；token-choice=2 时使用，也可作为自动扫描失败后的备用 token")
     parser.add_argument("--resources", default=None, help="资源选择：支持 all、序号、精确名称和 *、? 通配符，多个条件用逗号分隔；非交互模式默认 all")
@@ -2985,6 +2987,50 @@ def choose_token(args):
     return token
 
 
+def load_target_probe_module():
+    path = SCRIPT_DIR / "fivem_connection_probe.py"
+    if not path.is_file():
+        raise RuntimeError("找不到 FiveM 自动地址探测组件，请更新 dump-tool 组件。")
+    spec = importlib.util.spec_from_file_location("ck_target_probe", str(path.resolve()))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("无法加载 FiveM 自动地址探测组件。")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def resolve_target_from_fivem(token):
+    emit_progress(7, "target", "正在扫描当前 FiveM 连接并验证服务器地址。")
+    print("[地址] 目标为空，开始扫描当前 FiveM 进程。")
+    probe = load_target_probe_module()
+    probe_args = probe.parse_args([])
+    detection = probe.run_probe(probe_args)
+    candidates = {}
+    for index, item in enumerate(detection.get("candidates") or []):
+        if not isinstance(item, dict) or not item.get("address"):
+            continue
+        candidates["candidate-%d" % index] = item
+    if not candidates:
+        raise SessionPauseError("未找到当前 FiveM 的服务器地址候选，请确认已经进入服务器。")
+    verification = probe.verify_candidates(
+        candidates,
+        dump_tool_dir=str(SCRIPT_DIR),
+        limit=probe_args.verify_limit,
+        timeout_seconds=probe_args.verify_timeout,
+        token=token,
+    )
+    verified = verification.get("verified") if isinstance(verification, dict) else None
+    if not verified or not verified.get("address"):
+        raise SessionPauseError("已扫描到地址候选，但没有候选通过当前 FiveM Token 验证。")
+    address = str(verified["address"])
+    emit_progress(12, "target", "已验证当前 FiveM 服务器: %s" % address)
+    print(
+        "[地址] 已从当前 FiveM 自动识别并通过 Token 验证: %s（%s，资源 %s 个）"
+        % (address, verified.get("transport") or "http", verified.get("resource_count", 0))
+    )
+    return address
+
+
 def run_resource_listing(args):
     os.chdir(SCRIPT_DIR)
     payload = {
@@ -3000,13 +3046,18 @@ def run_resource_listing(args):
     }
     try:
         target = (args.target or "").strip()
+        token = None
+        if not target and getattr(args, "auto_target", False):
+            token = choose_token(args)
+            target = resolve_target_from_fivem(token)
         if not target and not args.non_interactive:
             target = input("Enter a cfx.re link or IP:port: ").strip()
         if not target:
             raise RuntimeError("Target address is required")
         payload["target"] = target
 
-        token = choose_token(args)
+        if token is None:
+            token = choose_token(args)
         emit_progress(15, "resolve", "Resolving server address")
         endpoint = resolve_server_endpoint(target, token=token)
         payload["server_address"] = endpoint["address"]
@@ -3363,10 +3414,15 @@ def run_tool(args):
             print("[Java] 本次选择保留原始资源，不执行 FXAP 解密，无需 Java。")
 
         target = (args.target or "").strip()
+        token = None
+        if not target and getattr(args, "auto_target", False):
+            token = choose_token(args)
+            target = resolve_target_from_fivem(token)
         if not target and not args.non_interactive:
             target = input("请输入 cfx.re 链接或 IP:端口: ").strip()
         if not target:
             raise RuntimeError("缺少目标地址，请输入 cfx.re 链接或 IP:端口。")
+        args.target = target
         report["target"] = target
         session_data["target"] = target
         save_session()
@@ -3384,7 +3440,8 @@ def run_tool(args):
                 f"资源 {len(retry_plan['files_by_resource'])} 个，失败文件 {retry_plan['requested_files']} 个。"
             )
 
-        token = choose_token(args)
+        if token is None:
+            token = choose_token(args)
 
         emit_progress(15, "resolve", "正在解析服务器地址。")
         endpoint = resolve_server_endpoint(target, token=token)

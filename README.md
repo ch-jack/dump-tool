@@ -54,6 +54,7 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --no-download-stream
 python auto.py 1.2.3.4:30120 --token-choice 1 --vertex-fix
 python auto.py --retry-failed-report "C:\path\to\previous-report.json" --non-interactive
 python auto.py --resume-session "C:\path\to\session.json" --non-interactive
+python auto.py --auto-target --token-choice 1 --list-resources --non-interactive
 ```
 
 非交互模式，供 CK 工具箱调用：
@@ -100,6 +101,7 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 - `--retry-failed-report` 读取上一次 JSON 报告，只选择其中 `failed_downloads` 和等待解密前置文件的项目重新下载，并合并回报告记录的原输出目录；新报告可以继续用于下一轮补充
 - Dump 会在任务目录保存 `session.json`；连接中断后工具箱显示“继续 Dump”，重新进入游戏后点击即可重新扫描 token 并跳过已经完成的资源。未完成文件使用 `.part` 临时文件，继续时重新下载。
 - `--wait-for-game --status-file <path>` 会在没有 FiveM token 或连接中断时等待并自动用 `--resume-session` 继续；状态文件记录当前阶段、百分比、提示、报告路径和已完成资源数，供工具箱显示静默 Dump 进度。
+- `--auto-target` 会在目标地址为空时扫描当前 FiveM 进程和内存候选，并使用当前 Token 请求 `/client` 的 `getConfiguration` 验证；只有返回有效 `resources` 配置的地址才会进入 Dump。
 - 静默 Dump 通过 `--resources` 直接使用资源匹配表达式（例如 `aaa*`），不会弹出资源选择窗口；下载完成但仍有失败文件时，报告可以继续交给 `--retry-failed-report` 补充下载。
 - 选择“开始服务器 Dump”会创建新的任务，不会接管之前暂停的任务；旧任务状态和已完成输出会保留。
 - 解密模式补充 stream/普通文件时会额外下载该资源必要的 RPF/`.fxap` 上下文，否则无法安全解密；已经成功且不是解密前置的文件不会重复下载
