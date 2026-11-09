@@ -35,6 +35,7 @@ TOOL_VERSION = "0.1.0"
 DEFAULT_LOG_MAX_AGE = 6 * 60 * 60
 DEFAULT_LOG_FILES = 8
 DEFAULT_LOG_TAIL_BYTES = 1024 * 1024
+DEFAULT_LOG_HEAD_BYTES = 64 * 1024
 WEB_PORTS = {53, 80, 443, 8080, 8443}
 GAME_PORT_HINTS = {30120, 30121, 30122, 30123, 30124, 30125}
 MEMORY_CHUNK_SIZE = 1024 * 1024
@@ -321,12 +322,22 @@ def infer_log_dirs(processes, explicit_root=None, explicit_logs=None):
     return result
 
 
-def read_tail(path, max_bytes):
+def read_log_excerpt(path, max_bytes):
     with open(str(path), "rb") as handle:
         handle.seek(0, os.SEEK_END)
         size = handle.tell()
-        handle.seek(max(0, size - max_bytes), os.SEEK_SET)
-        return handle.read().decode("utf-8", errors="replace")
+        handle.seek(0)
+        if size <= max_bytes:
+            data = handle.read(max_bytes)
+        else:
+            # FiveM writes the launch/connect URI near the start of the log.
+            # Busy sessions quickly push that evidence out of the tail.
+            head_bytes = min(DEFAULT_LOG_HEAD_BYTES, max_bytes // 2)
+            head = handle.read(head_bytes)
+            tail_bytes = max_bytes - head_bytes
+            handle.seek(size - tail_bytes)
+            data = head + b"\n" + handle.read(tail_bytes)
+        return data.decode("utf-8", errors="replace")
 
 
 def scan_recent_logs(processes, candidates, logs_dir=None, fivem_root=None, max_age=DEFAULT_LOG_MAX_AGE,
@@ -353,7 +364,7 @@ def scan_recent_logs(processes, candidates, logs_dir=None, fivem_root=None, max_
                 continue
             if not allow_stale and oldest_process_start and mtime < oldest_process_start - 300:
                 continue
-            text = read_tail(path, DEFAULT_LOG_TAIL_BYTES)
+            text = read_log_excerpt(path, DEFAULT_LOG_TAIL_BYTES)
         except (OSError, UnicodeError):
             continue
 
@@ -422,7 +433,7 @@ def scan_network_connections(processes, candidates):
             add_candidate(candidates, endpoint, "process-network", score, entry, evidence, time.time())
 
 
-def scan_process_memory(processes, candidates, timeout_seconds=45.0):
+def scan_process_memory(processes, candidates, timeout_seconds=45.0, on_progress=None):
     """Search readable FiveM game memory for IPv4:port strings.
 
     This deliberately searches only endpoint-shaped strings.  It does not
@@ -474,6 +485,7 @@ def scan_process_memory(processes, candidates, timeout_seconds=45.0):
     page_guard = 0x100
     readable_protect = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80
     deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    next_progress = time.monotonic()
     stats = {"supported": True, "scanned": False, "regions": 0, "bytes": 0, "timed_out": False}
 
     for entry in game_entries:
@@ -510,9 +522,16 @@ def scan_process_memory(processes, candidates, timeout_seconds=45.0):
                     region_base = int(mbi.BaseAddress or 0)
                     offset = 0
                     while offset < region_size:
-                        if time.monotonic() >= deadline:
+                        now = time.monotonic()
+                        if now >= deadline:
                             stats["timed_out"] = True
                             break
+                        if on_progress and now >= next_progress:
+                            on_progress(
+                                "内存扫描：已读取 %d MB，找到 %d 个地址候选，剩余最多 %.0f 秒。"
+                                % (stats["bytes"] // (1024 * 1024), len(candidates), deadline - now)
+                            )
+                            next_progress = now + 2.0
                         read_size = min(MEMORY_CHUNK_SIZE, region_size - offset)
                         buffer = (ctypes.c_char * read_size)()
                         bytes_read = size_t()
@@ -565,7 +584,8 @@ def load_dump_auto_module(dump_tool_dir):
     return module
 
 
-def verify_candidates(candidates, dump_tool_dir, limit=20, timeout_seconds=5.0, token=None):
+def verify_candidates(candidates, dump_tool_dir, limit=20, timeout_seconds=5.0, token=None,
+                      on_progress=None):
     """Authenticate endpoint candidates with the current FiveM Token.
 
     Only the configuration response shape is retained.  The Token and response
@@ -609,7 +629,7 @@ def verify_candidates(candidates, dump_tool_dir, limit=20, timeout_seconds=5.0, 
         "User-Agent": "CitizenFX/1",
     })
     try:
-        for candidate in ranked:
+        for index, candidate in enumerate(ranked, start=1):
             address = str(candidate.get("address") or "")
             try:
                 host, port = endpoint_parts(address)
@@ -628,6 +648,11 @@ def verify_candidates(candidates, dump_tool_dir, limit=20, timeout_seconds=5.0, 
             }
             for scheme in ("https", "http"):
                 url = "%s://%s:%d/client" % (scheme, host_for_url, port)
+                if on_progress:
+                    on_progress(
+                        "正在验证地址 %d/%d：%s（%s）。"
+                        % (index, len(ranked), address, scheme.upper())
+                    )
                 response = None
                 try:
                     response = session.post(
@@ -651,16 +676,17 @@ def verify_candidates(candidates, dump_tool_dir, limit=20, timeout_seconds=5.0, 
                         "reason": "返回有效服务器资源配置",
                     })
                     result["tested"].append(tested)
-                    if result["verified"] is None:
-                        result["verified"] = {
-                            "address": address,
-                            "transport": scheme,
-                            "resource_count": len(resources),
-                            "source": candidate.get("source"),
-                            "pid": candidate.get("pid"),
-                            "process": candidate.get("process"),
-                        }
-                    break
+                    result["verified"] = {
+                        "address": address,
+                        "transport": scheme,
+                        "resource_count": len(resources),
+                        "resource_names": [str(resource.get("name", "")) for resource in resources],
+                        "source": candidate.get("source"),
+                        "pid": candidate.get("pid"),
+                        "process": candidate.get("process"),
+                    }
+                    result["status"] = "verified"
+                    return result
                 except requests.RequestException as exc:
                     tested["reason"] = type(exc).__name__
                 except (ValueError, TypeError) as exc:
@@ -672,8 +698,6 @@ def verify_candidates(candidates, dump_tool_dir, limit=20, timeout_seconds=5.0, 
                 result["tested"].append(tested)
     finally:
         session.close()
-    if result["verified"] is not None:
-        result["status"] = "verified"
     return result
 
 
@@ -706,8 +730,10 @@ def build_report(processes, candidates, log_hits, started_at, memory_scan=None, 
     }
 
 
-def run_probe(args):
+def run_probe(args, on_progress=None, token=None):
     started_at = time.time()
+    if on_progress:
+        on_progress("正在读取 FiveM 进程及启动参数。")
     processes = collect_fivem_processes()
     candidates = {}
     scan_process_arguments(processes, candidates)
@@ -716,6 +742,8 @@ def run_probe(args):
     # caller explicitly supplies an installation directory.
     log_hits = []
     if processes:
+        if on_progress:
+            on_progress("已找到 %d 个 FiveM 进程，正在检查近期连接日志。" % len(processes))
         log_hits = scan_recent_logs(
             processes,
             candidates,
@@ -725,20 +753,45 @@ def run_probe(args):
             allow_stale=args.allow_stale_logs,
         )
     if processes and not args.no_network:
+        if on_progress:
+            on_progress("正在读取 FiveM 网络连接。")
         scan_network_connections(processes, candidates)
     memory_scan = {"supported": False, "scanned": False, "regions": 0, "bytes": 0, "timed_out": False}
-    strong_sources = {"process-commandline", "recent-citizenfx-log"}
-    has_strong_candidate = any(item.get("source") in strong_sources for item in candidates.values())
-    if processes and args.memory_scan and not has_strong_candidate:
-        memory_scan = scan_process_memory(processes, candidates, timeout_seconds=args.memory_timeout)
     verification = {"status": "not-run"}
-    if args.verify:
+    strong_sources = {"process-commandline", "recent-citizenfx-log"}
+    strong_candidates = {
+        key: item for key, item in candidates.items() if item.get("source") in strong_sources
+    }
+    if args.verify and strong_candidates:
+        if on_progress:
+            on_progress("正在验证启动参数和日志中的地址候选。")
+        verification = verify_candidates(
+            strong_candidates,
+            dump_tool_dir=args.dump_tool_dir,
+            limit=args.verify_limit,
+            timeout_seconds=args.verify_timeout,
+            token=token,
+            on_progress=on_progress,
+        )
+
+    needs_memory = not verification.get("verified") if args.verify else not strong_candidates
+    if processes and args.memory_scan and needs_memory:
+        if on_progress:
+            on_progress("尚未确认有效地址，开始内存扫描（最多 %.0f 秒）。" % args.memory_timeout)
+        memory_scan = scan_process_memory(
+            processes, candidates, timeout_seconds=args.memory_timeout, on_progress=on_progress,
+        )
+    if args.verify and not verification.get("verified"):
         verification = verify_candidates(
             candidates,
             dump_tool_dir=args.dump_tool_dir,
             limit=args.verify_limit,
             timeout_seconds=args.verify_timeout,
+            token=token,
+            on_progress=on_progress,
         )
+    if on_progress:
+        on_progress("地址扫描结束，共找到 %d 个候选。" % len(candidates))
     report = build_report(
         processes,
         candidates,
@@ -823,7 +876,7 @@ def parse_args(argv):
     parser.add_argument("--fivem-root", default="", help="FiveM.app 目录；默认从进程路径和 LOCALAPPDATA 推断。")
     parser.add_argument("--logs-dir", default="", help="直接指定 CitizenFX 日志目录。")
     parser.add_argument("--max-log-age", type=float, default=DEFAULT_LOG_MAX_AGE, help="允许读取的日志最大年龄（秒）。")
-    parser.add_argument("--allow-stale-logs", action="store_true", help="允许读取早于当前进程启动时间的日志，仅用于诊断。")
+    parser.add_argument("--allow-stale-logs", action="store_true", help="允许读取早于当前进程启动时间的近期日志。")
     parser.add_argument("--no-network", action="store_true", help="不读取进程网络连接，只检查参数和日志。")
     parser.add_argument("--memory-scan", dest="memory_scan", action="store_true", help="在其他来源没有候选地址时扫描 FiveM 游戏进程内存（默认开启）。")
     parser.add_argument("--no-memory-scan", dest="memory_scan", action="store_false", help="关闭内存地址扫描。")

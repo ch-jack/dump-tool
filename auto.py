@@ -37,7 +37,7 @@ for _console_stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError, ValueError):
         pass
 
-TOOL_VERSION = "1.1.27"
+TOOL_VERSION = "1.1.28"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MIN_FREE_GB = 5.0
 BYTES_PER_GB = 1024 ** 3
@@ -3003,23 +3003,20 @@ def resolve_target_from_fivem(token):
     emit_progress(7, "target", "正在扫描当前 FiveM 连接并验证服务器地址。")
     print("[地址] 目标为空，开始扫描当前 FiveM 进程。")
     probe = load_target_probe_module()
-    probe_args = probe.parse_args([])
-    detection = probe.run_probe(probe_args)
-    candidates = {}
-    for index, item in enumerate(detection.get("candidates") or []):
-        if not isinstance(item, dict) or not item.get("address"):
-            continue
-        candidates["candidate-%d" % index] = item
-    if not candidates:
+    # Earlier logs can retain the connect URI after a launcher restart.
+    # They are only hints: the current Token must still validate the endpoint.
+    probe_args = probe.parse_args(["--verify", "--allow-stale-logs"])
+    probe_args.dump_tool_dir = str(SCRIPT_DIR)
+
+    def show_target_progress(message):
+        print("[地址] " + message, flush=True)
+        emit_progress(7, "target", message)
+
+    detection = probe.run_probe(probe_args, on_progress=show_target_progress, token=token)
+    if not detection.get("candidates"):
         raise SessionPauseError("未找到当前 FiveM 的服务器地址候选，请确认已经进入服务器。")
-    verification = probe.verify_candidates(
-        candidates,
-        dump_tool_dir=str(SCRIPT_DIR),
-        limit=probe_args.verify_limit,
-        timeout_seconds=probe_args.verify_timeout,
-        token=token,
-    )
-    verified = verification.get("verified") if isinstance(verification, dict) else None
+    verification = detection.get("verification") or {}
+    verified = verification.get("verified")
     if not verified or not verified.get("address"):
         raise SessionPauseError("已扫描到地址候选，但没有候选通过当前 FiveM Token 验证。")
     address = str(verified["address"])
@@ -3028,7 +3025,7 @@ def resolve_target_from_fivem(token):
         "[地址] 已从当前 FiveM 自动识别并通过 Token 验证: %s（%s，资源 %s 个）"
         % (address, verified.get("transport") or "http", verified.get("resource_count", 0))
     )
-    return address
+    return verified
 
 
 def run_resource_listing(args):
@@ -3047,9 +3044,11 @@ def run_resource_listing(args):
     try:
         target = (args.target or "").strip()
         token = None
+        auto_target_result = None
         if not target and getattr(args, "auto_target", False):
             token = choose_token(args)
-            target = resolve_target_from_fivem(token)
+            auto_target_result = resolve_target_from_fivem(token)
+            target = auto_target_result["address"]
         if not target and not args.non_interactive:
             target = input("Enter a cfx.re link or IP:port: ").strip()
         if not target:
@@ -3058,25 +3057,35 @@ def run_resource_listing(args):
 
         if token is None:
             token = choose_token(args)
-        emit_progress(15, "resolve", "Resolving server address")
-        endpoint = resolve_server_endpoint(target, token=token)
-        payload["server_address"] = endpoint["address"]
-        payload["base_url"] = endpoint["base_urls"][0]
+        if auto_target_result is not None:
+            # Token verification already fetched this exact configuration.
+            payload["server_address"] = auto_target_result["address"]
+            payload["base_url"] = "%s://%s" % (auto_target_result["transport"], target)
+            payload["target"] = payload["base_url"]
+            payload["resources"] = [
+                {"index": index, "name": name}
+                for index, name in enumerate(auto_target_result["resource_names"])
+            ]
+        else:
+            emit_progress(15, "resolve", "Resolving server address")
+            endpoint = resolve_server_endpoint(target, token=token)
+            payload["server_address"] = endpoint["address"]
+            payload["base_url"] = endpoint["base_urls"][0]
 
-        dumper = FiveMDumper(
-            endpoint["base_urls"][0],
-            token,
-            max_workers=1,
-            fallback_base_urls=endpoint["base_urls"][1:],
-        )
-        resources = dumper.get_configuration(save_grants=False)
-        payload["base_url"] = dumper.base_url
-        payload["resources"] = [
-            {"index": index, "name": str(resource.get("name", ""))}
-            for index, resource in enumerate(resources)
-        ]
+            dumper = FiveMDumper(
+                endpoint["base_urls"][0],
+                token,
+                max_workers=1,
+                fallback_base_urls=endpoint["base_urls"][1:],
+            )
+            resources = dumper.get_configuration(save_grants=False)
+            payload["base_url"] = dumper.base_url
+            payload["resources"] = [
+                {"index": index, "name": str(resource.get("name", ""))}
+                for index, resource in enumerate(resources)
+            ]
         payload["status"] = "success"
-        emit_progress(100, "resource_list", f"Loaded {len(resources)} resources")
+        emit_progress(100, "resource_list", f"Loaded {len(payload['resources'])} resources")
     except Exception as exc:
         payload["error"] = str(exc)
         print_error(payload["error"])
@@ -3415,9 +3424,15 @@ def run_tool(args):
 
         target = (args.target or "").strip()
         token = None
+        endpoint = None
         if not target and getattr(args, "auto_target", False):
             token = choose_token(args)
-            target = resolve_target_from_fivem(token)
+            detected = resolve_target_from_fivem(token)
+            target = detected["address"]
+            endpoint = {
+                "address": target,
+                "base_urls": ["%s://%s" % (detected["transport"], target)],
+            }
         if not target and not args.non_interactive:
             target = input("请输入 cfx.re 链接或 IP:端口: ").strip()
         if not target:
@@ -3444,7 +3459,8 @@ def run_tool(args):
             token = choose_token(args)
 
         emit_progress(15, "resolve", "正在解析服务器地址。")
-        endpoint = resolve_server_endpoint(target, token=token)
+        if endpoint is None:
+            endpoint = resolve_server_endpoint(target, token=token)
         report["server_address"] = endpoint["address"]
         report["base_url"] = endpoint["base_urls"][0]
         print(f"[地址] 服务器地址: {endpoint['address']}")

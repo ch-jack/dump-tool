@@ -137,7 +137,7 @@ class RawResourcePreservationTests(unittest.TestCase):
 
             args = auto.parse_args(
                 [
-                    "127.0.0.1:30120",
+                    "--auto-target",
                     "--token-choice",
                     "1",
                     "--resources",
@@ -152,6 +152,7 @@ class RawResourcePreservationTests(unittest.TestCase):
             )
 
             def fake_dump_run(dumper, _resources_choice, on_resource_ready=None):
+                self.assertEqual(dumper.base_url, "http://127.0.0.1:30120")
                 dumper.summary["resources_total"] = 1
                 dumper.summary["resources_selected"] = 1
                 dumper.summary["downloaded_files"] = 3
@@ -173,8 +174,11 @@ class RawResourcePreservationTests(unittest.TestCase):
             old_cwd = os.getcwd()
             try:
                 with mock.patch("auto.choose_token", return_value="test-token"), mock.patch(
+                    "auto.resolve_target_from_fivem",
+                    return_value={"address": "127.0.0.1:30120", "transport": "http", "resource_names": ["protected_resource"]},
+                ), mock.patch(
                     "auto.resolve_server_endpoint",
-                    return_value={"address": "127.0.0.1:30120", "base_urls": ["http://127.0.0.1:30120"]},
+                    return_value={"address": "127.0.0.1:30120", "base_urls": ["https://127.0.0.1:30120", "http://127.0.0.1:30120"]},
                 ), mock.patch("auto.FiveMDumper.run", autospec=True, side_effect=fake_dump_run), mock.patch(
                     "auto.resolve_java_executable",
                     side_effect=AssertionError("raw mode must not inspect Java"),
