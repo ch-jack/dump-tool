@@ -148,6 +148,14 @@ def write_json_atomic(path, payload):
     os.replace(str(temporary), str(path))
 
 
+def write_text_atomic(path, text):
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(str(text), encoding="utf-8")
+    os.replace(str(temporary), str(path))
+
+
 def update_status_file(
     status=None,
     percent=None,
@@ -2709,6 +2717,8 @@ def parse_args(argv):
     parser.add_argument("--session-file", default="", help="保存本次 Dump 任务状态的 JSON 文件")
     parser.add_argument("--resume-session", default="", help="从之前中断的 Dump 任务状态继续")
     parser.add_argument("--list-resources", action="store_true", help="仅获取并输出服务器资源清单，不执行 Dump")
+    parser.add_argument("--list-files", action="store_true", help="仅获取服务器文件列表，不下载文件内容")
+    parser.add_argument("--file-list-output", default="", help="文件列表 JSON 输出路径；同时生成同名 TXT 文件")
     parser.add_argument("--output", default="Output", help="Dump 处理输出目录")
     parser.add_argument("--report", default="", help="报告路径。可传 report.json、report.md 或目录")
     parser.add_argument("--java", default="", help="Java 安装目录或 java.exe；最低 Java 8，推荐 Java 17")
@@ -3026,6 +3036,174 @@ def resolve_target_from_fivem(token):
         % (address, verified.get("transport") or "http", verified.get("resource_count", 0))
     )
     return verified
+
+
+def resolve_file_list_paths(output_arg):
+    path = Path(output_arg or "Output/server_file_list.json").expanduser()
+    if path.suffix.lower() != ".json":
+        path = path / "server_file_list.json"
+    path = path.resolve()
+    return path, path.with_suffix(".txt")
+
+
+def build_file_list_payload(resources, target, server_address, base_url):
+    resource_items = []
+    regular_count = 0
+    stream_count = 0
+    for index, resource in enumerate(resources or []):
+        if not isinstance(resource, dict):
+            continue
+        files = []
+        for file_name, file_data in (resource.get("files") or {}).items():
+            item = {"path": str(file_name).replace("\\", "/")}
+            file_hash = get_file_hash(file_data)
+            if file_hash:
+                item["hash"] = str(file_hash)
+            files.append(item)
+
+        stream_files = []
+        for file_name, file_data in (resource.get("streamFiles") or {}).items():
+            item = {"path": str(file_name).replace("\\", "/")}
+            file_hash = get_file_hash(file_data)
+            if file_hash:
+                item["hash"] = str(file_hash)
+            stream_files.append(item)
+
+        regular_count += len(files)
+        stream_count += len(stream_files)
+        resource_items.append(
+            {
+                "index": index,
+                "name": str(resource.get("name", "")),
+                "files": files,
+                "stream_files": stream_files,
+            }
+        )
+
+    return {
+        "schemaVersion": 1,
+        "version": TOOL_VERSION,
+        "command": "list-files",
+        "status": "success",
+        "target": str(target or ""),
+        "server_address": str(server_address or ""),
+        "base_url": str(base_url or ""),
+        "generated_at": now_iso(),
+        "summary": {
+            "resources": len(resource_items),
+            "files": regular_count,
+            "stream_files": stream_count,
+            "total_files": regular_count + stream_count,
+        },
+        "resources": resource_items,
+    }
+
+
+def build_file_list_text(payload):
+    summary = payload.get("summary") or {}
+    lines = [
+        "服务器文件列表",
+        f"目标: {payload.get('target', '')}",
+        f"服务器地址: {payload.get('server_address', '')}",
+        f"生成时间: {payload.get('generated_at', '')}",
+        f"资源数: {summary.get('resources', 0)}",
+        f"普通文件: {summary.get('files', 0)}",
+        f"stream 文件: {summary.get('stream_files', 0)}",
+        f"文件总数: {summary.get('total_files', 0)}",
+        "",
+    ]
+    for resource in payload.get("resources") or []:
+        resource_name = str(resource.get("name", ""))
+        lines.append(f"[{resource.get('index', '')}] {resource_name}")
+        for item in resource.get("files") or []:
+            lines.append(f"{resource_name}/{item.get('path', '')}")
+        for item in resource.get("stream_files") or []:
+            lines.append(f"{resource_name}/stream/{item.get('path', '')}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def run_file_listing(args):
+    os.chdir(SCRIPT_DIR)
+    json_path, text_path = resolve_file_list_paths(getattr(args, "file_list_output", ""))
+    payload = {
+        "schemaVersion": 1,
+        "version": TOOL_VERSION,
+        "command": "list-files",
+        "status": "error",
+        "target": args.target or "",
+        "server_address": "",
+        "base_url": "",
+        "generated_at": now_iso(),
+        "output": str(json_path),
+        "text_output": str(text_path),
+        "summary": {"resources": 0, "files": 0, "stream_files": 0, "total_files": 0},
+        "resources": [],
+        "error": "",
+    }
+    try:
+        target = (args.target or "").strip()
+        token = None
+        auto_target_result = None
+        if not target and getattr(args, "auto_target", False):
+            token = choose_token(args)
+            auto_target_result = resolve_target_from_fivem(token)
+            target = auto_target_result["address"]
+        if not target and not args.non_interactive:
+            target = input("Enter a cfx.re link or IP:port: ").strip()
+        if not target:
+            raise RuntimeError("Target address is required")
+
+        if token is None:
+            token = choose_token(args)
+
+        if auto_target_result is not None:
+            transport = auto_target_result.get("transport") or "http"
+            server_address = auto_target_result["address"]
+            requested_target = "%s://%s" % (transport, server_address)
+            dumper = FiveMDumper(requested_target, token, max_workers=1)
+        else:
+            emit_progress(15, "resolve", "Resolving server address")
+            endpoint = resolve_server_endpoint(target, token=token)
+            server_address = endpoint["address"]
+            dumper = FiveMDumper(
+                endpoint["base_urls"][0],
+                token,
+                max_workers=1,
+                fallback_base_urls=endpoint["base_urls"][1:],
+            )
+
+        resources = dumper.get_configuration(save_grants=False)
+        payload = build_file_list_payload(
+            resources,
+            requested_target if auto_target_result is not None else target,
+            server_address,
+            dumper.base_url,
+        )
+        payload["output"] = str(json_path)
+        payload["text_output"] = str(text_path)
+        write_json_atomic(json_path, payload)
+        write_text_atomic(text_path, build_file_list_text(payload))
+        emit_progress(100, "file_list", "文件列表已保存到输出目录。")
+        print(f"[文件列表] JSON: {json_path}")
+        print(f"[文件列表] TXT: {text_path}")
+        if args.auto_open and json_path.parent.is_dir():
+            try:
+                if os.name == "nt":
+                    os.startfile(str(json_path.parent))
+                else:
+                    subprocess.Popen(["xdg-open", str(json_path.parent)])
+            except OSError as exc:
+                print_warning(f"自动打开输出目录失败: {exc}")
+    except Exception as exc:
+        payload["status"] = "error"
+        payload["error"] = str(exc)
+        print_error(payload["error"])
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    print("CK_FILE_LIST " + serialized, flush=True)
+    print(serialized, flush=True)
+    return 0 if payload["status"] == "success" else 2
 
 
 def run_resource_listing(args):
@@ -3679,6 +3857,8 @@ def run_tool(args):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.list_files:
+        return run_file_listing(args)
     if args.list_resources:
         return run_resource_listing(args)
     if not args.wait_for_game:

@@ -55,6 +55,7 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --vertex-fix
 python auto.py --retry-failed-report "C:\path\to\previous-report.json" --non-interactive
 python auto.py --resume-session "C:\path\to\session.json" --non-interactive
 python auto.py --auto-target --token-choice 1 --list-resources --non-interactive
+python auto.py 1.2.3.4:30120 --token-choice 1 --list-files --file-list-output Output\server_file_list.json --non-interactive --auto-open
 ```
 
 非交互模式，供 CK 工具箱调用：
@@ -84,6 +85,14 @@ python auto.py 1.2.3.4:30120 --token-choice 1 --resources "esx_*,qb-*" --non-int
 ```
 
 不传 `--resources` 且使用交互模式时，程序会在获取清单后显示编号菜单，预览匹配结果并要求确认。CK 工具箱使用独立的“获取资源清单”步骤，在菜单确认后通过 `--resources-file` 将精确资源名传给正式 Dump。
+
+只获取服务器文件列表，不下载资源文件内容：
+
+```bat
+python auto.py 1.2.3.4:30120 --token-choice 1 --list-files --file-list-output Output\server_file_list.json --non-interactive --auto-open
+```
+
+该命令只请求服务器配置中的普通文件和 `stream` 文件元数据，生成同名 `.json` 和 `.txt` 文件，并可在完成后自动打开输出目录。
 
 ## 输出
 
